@@ -242,7 +242,9 @@ class DeltaTableV2 private(
         base.put(TableCatalog.PROP_OWNER, table.owner)
       }
       v1Table.storage.properties.foreach { case (key, value) =>
-        base.put(TableCatalog.OPTION_PREFIX + key, value)
+        if (!base.contains(key)) {
+          base.put(TableCatalog.OPTION_PREFIX + key, value)
+        }
       }
       if (v1Table.tableType == CatalogTableType.EXTERNAL) {
         base.put(TableCatalog.PROP_EXTERNAL, "true")

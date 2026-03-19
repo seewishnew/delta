@@ -19,7 +19,9 @@ package io.sparkuctest;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -71,6 +73,80 @@ public class UCDeltaUtilityTest extends UCDeltaTableIntegrationBaseTest {
     }
 
     Assertions.assertThat(prunedResults).isEqualTo(expected);
+  }
+
+  @TestAllTableTypes
+  public void testNoOptionPrefixDuplicatesInTableProperties(TableType tableType) throws Exception {
+    withNewTable(
+        "no_option_dupes",
+        "id INT, name STRING",
+        null, // no partition
+        tableType,
+        "'myUserProp'='myUserValue'",
+        tableName -> {
+          sql("INSERT INTO %s VALUES (1, 'hello')", tableName);
+
+          // --- SHOW TBLPROPERTIES ---
+          List<List<String>> propRows = sql("SHOW TBLPROPERTIES %s", tableName);
+          Set<String> propKeys = new HashSet<>();
+          for (List<String> row : propRows) {
+            propKeys.add(row.get(0));
+          }
+
+          // For every key without an "option." prefix, there must NOT also be
+          // an "option." + key entry — that would be a duplicate.
+          for (String key : propKeys) {
+            if (!key.startsWith("option.")) {
+              Assertions.assertThat(propKeys)
+                  .as("Property '%s' must not also appear as 'option.%s' (duplicate)", key, key)
+                  .doesNotContain("option." + key);
+            }
+          }
+
+          Assertions.assertThat(propKeys)
+              .as("User-set table property should be visible")
+              .contains("myUserProp");
+          Assertions.assertThat(propKeys)
+              .as("Delta protocol property should be visible")
+              .contains("delta.minReaderVersion");
+
+          // --- DESCRIBE EXTENDED ---
+          List<List<String>> descRows = sql("DESCRIBE EXTENDED %s", tableName);
+          boolean foundTableProperties = false;
+          for (List<String> row : descRows) {
+            if (row.size() >= 2 && "Table Properties".equals(row.get(0))) {
+              foundTableProperties = true;
+              String propsStr = row.get(1);
+              Assertions.assertThat(propsStr)
+                  .as("DESCRIBE EXTENDED should show user properties")
+                  .contains("myUserProp=myUserValue");
+
+              // Verify no key appears both with and without option. prefix.
+              // The property string looks like "[k1=v1,k2=v2,...]".
+              String inner = propsStr;
+              if (inner.startsWith("[")) inner = inner.substring(1);
+              if (inner.endsWith("]")) inner = inner.substring(0, inner.length() - 1);
+              Set<String> descKeys = new HashSet<>();
+              for (String entry : inner.split(",")) {
+                String k = entry.split("=", 2)[0].trim();
+                descKeys.add(k);
+              }
+              for (String k : descKeys) {
+                if (!k.startsWith("option.")) {
+                  Assertions.assertThat(descKeys)
+                      .as("DESC EXTENDED: '%s' duplicated as 'option.%s'", k, k)
+                      .doesNotContain("option." + k);
+                }
+              }
+            }
+          }
+          Assertions.assertThat(foundTableProperties)
+              .as("DESCRIBE EXTENDED must include a 'Table Properties' row")
+              .isTrue();
+
+          // Verify data path still works after the change.
+          check(tableName, List.of(List.of("1", "hello")));
+        });
   }
 
   @Test

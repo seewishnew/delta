@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 // scalastyle:off import.ordering.noEmptyLine
 import org.apache.spark.sql.delta.actions.{Action, TableFeatureProtocolUtils}
+import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.delta.commands.cdc.CDCReader
 import org.apache.spark.sql.delta.coordinatedcommits.{CatalogOwnedTableUtils, CatalogOwnedTestBaseSuite}
 import org.apache.spark.sql.delta.files.TahoeLogFileIndex
@@ -37,9 +38,11 @@ import org.apache.spark.SparkException
 import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable, CatalogTableType}
 import org.apache.spark.sql.catalyst.expressions.InSet
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.plans.logical.Filter
+import org.apache.spark.sql.connector.catalog.TableCatalog
 import org.apache.spark.sql.execution.FileSourceScanExec
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelationWithTable}
 import org.apache.spark.sql.functions.{asc, col, expr, lit, map_values, struct}
@@ -3011,6 +3014,60 @@ class DeltaSuite extends QueryTest
 
     // Not properly supported: ambiguous without special handling for escaping.
     assert(parseTableAndAlias("'store sales'") === "'store" -> Some("sales'"))
+  }
+
+  test("DeltaTableV2.properties() deduplicates storage keys already present in snapshot") {
+    withTempDir { dir =>
+      spark.range(1).write.format("delta").save(dir.getAbsolutePath)
+
+      val tablePath = new Path(dir.toURI)
+      val snapshot = DeltaLog.forTable(spark, dir).update()
+      val snapshotProps = snapshot.getProperties
+
+      val overlappingKey = "delta.minReaderVersion"
+      assert(snapshotProps.contains(overlappingKey),
+        s"Precondition: snapshot must contain '$overlappingKey'")
+
+      val storageOnlyKey = "table_type"
+      assert(!snapshotProps.contains(storageOnlyKey),
+        s"Precondition: snapshot must not contain '$storageOnlyKey'")
+
+      val storageProps = Map(
+        overlappingKey -> snapshotProps(overlappingKey),
+        storageOnlyKey -> "MANAGED",
+        "path" -> dir.getAbsolutePath
+      )
+
+      val catalogTable = CatalogTable(
+        identifier = TableIdentifier("test_dedup"),
+        tableType = CatalogTableType.MANAGED,
+        storage = CatalogStorageFormat(
+          locationUri = Some(dir.toURI),
+          inputFormat = None,
+          outputFormat = None,
+          serde = None,
+          compressed = false,
+          properties = storageProps
+        ),
+        schema = new StructType().add("id", "long"),
+        provider = Some("delta")
+      )
+
+      val deltaTable = DeltaTableV2(spark, tablePath, Some(catalogTable))
+      val v2Props = deltaTable.properties()
+
+      // Overlapping key: base already has the unprefixed version, so the option.-prefixed
+      // duplicate must NOT appear.
+      assert(!v2Props.containsKey(TableCatalog.OPTION_PREFIX + overlappingKey),
+        s"'${TableCatalog.OPTION_PREFIX}$overlappingKey' should be deduplicated")
+      assert(v2Props.containsKey(overlappingKey),
+        s"Base property '$overlappingKey' must still be present")
+
+      // Storage-only key: not in the snapshot, so the option.-prefixed version SHOULD appear.
+      assert(v2Props.containsKey(TableCatalog.OPTION_PREFIX + storageOnlyKey),
+        s"'${TableCatalog.OPTION_PREFIX}$storageOnlyKey' should be present (storage-only)")
+      assert(v2Props.get(TableCatalog.OPTION_PREFIX + storageOnlyKey) === "MANAGED")
+    }
   }
 }
 

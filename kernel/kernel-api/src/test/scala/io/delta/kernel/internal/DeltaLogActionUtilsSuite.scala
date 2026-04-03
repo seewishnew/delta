@@ -21,7 +21,7 @@ import java.util.{Collections, Optional}
 import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 
-import io.delta.kernel.exceptions.{CommitRangeNotFoundException, InvalidTableException, KernelException, TableNotFoundException}
+import io.delta.kernel.exceptions.{CommitRangeNotFoundException, EndVersionNotFoundException, InvalidTableException, KernelException, StartVersionNotFoundException, TableNotFoundException}
 import io.delta.kernel.internal.DeltaLogActionUtils.{getCommitFilesForVersionRange, listDeltaLogFilesAsIter, verifyDeltaVersions}
 import io.delta.kernel.internal.fs.Path
 import io.delta.kernel.internal.util.FileNames
@@ -69,29 +69,48 @@ class DeltaLogActionUtilsSuite extends AnyFunSuite with MockFileSystemClientUtil
         Optional.of(4L),
         dataPath)
     }
-    // End-version or start-version not right
-    intercept[KernelException] {
+    // Start version not right
+    val startEx = intercept[StartVersionNotFoundException] {
       verifyDeltaVersions(
         getCommitFiles(Seq(1, 2, 3)),
         0,
         Optional.of(3L),
         dataPath)
     }
-    intercept[KernelException] {
+    assert(startEx.getStartVersionRequested == 0)
+    assert(startEx.getEarliestAvailableVersion == Optional.of(1L))
+    assert(startEx.getTablePath == dataPath.toString)
+    assert(startEx.getMessage.contains("no log file found for version 0"))
+    assert(startEx.getMessage.contains("Earliest available version is 1"))
+    assert(startEx.isInstanceOf[KernelException])
+    // End version not right
+    val endEx = intercept[EndVersionNotFoundException] {
       verifyDeltaVersions(
         getCommitFiles(Seq(1, 2, 3)),
         1,
         Optional.of(4L),
         dataPath)
     }
+    assert(endEx.getEndVersionRequested == 4)
+    assert(endEx.getLatestAvailableVersion == 3)
+    assert(endEx.getTablePath == dataPath.toString)
+    assert(endEx.getMessage.contains("no log file found for version 4"))
+    assert(endEx.getMessage.contains("Latest available version is 3"))
+    assert(endEx.isInstanceOf[KernelException])
     // Empty versions
-    intercept[KernelException] {
+    val emptyEx = intercept[StartVersionNotFoundException] {
       verifyDeltaVersions(
         getCommitFiles(Seq()),
         1,
         Optional.of(4L),
         dataPath)
     }
+    assert(emptyEx.getStartVersionRequested == 1)
+    assert(emptyEx.getEarliestAvailableVersion == Optional.empty())
+    assert(emptyEx.getTablePath == dataPath.toString)
+    assert(emptyEx.getMessage.contains("no log file found for version 1"))
+    assert(!emptyEx.getMessage.contains("Earliest available version"))
+    assert(emptyEx.isInstanceOf[KernelException])
     // Unsorted or duplicates (shouldn't be possible)
     intercept[InvalidTableException] {
       verifyDeltaVersions(
@@ -167,12 +186,12 @@ class DeltaLogActionUtilsSuite extends AnyFunSuite with MockFileSystemClientUtil
     files = deltaFileStatuses(Seq(1, 3)),
     expectedErrorMessageContains = "versions are not contiguous")
 
-  testGetCommitFilesExpectedError[KernelException](
+  testGetCommitFilesExpectedError[StartVersionNotFoundException](
     testName = "start version not available",
     files = deltaFileStatuses(Seq(2, 3, 4, 5)),
     expectedErrorMessageContains = "no log file found for version 1")
 
-  testGetCommitFilesExpectedError[KernelException](
+  testGetCommitFilesExpectedError[EndVersionNotFoundException](
     testName = "end version not available",
     files = deltaFileStatuses(Seq(0, 1, 2)),
     expectedErrorMessageContains = "no log file found for version 3")

@@ -221,6 +221,21 @@ public class SnapshotManager {
       Optional<Long> timeTravelVersionOpt,
       List<ParsedLogData> parsedLogDatas,
       Optional<Long> maxCatalogVersionOpt) {
+    return getLogSegmentForVersion(
+        engine, timeTravelVersionOpt, parsedLogDatas, maxCatalogVersionOpt, Optional.empty());
+  }
+
+  /**
+   * Overload that accepts an optional base {@link LogSegment} for incremental snapshot loading.
+   * When present, the {@code _last_checkpoint} read is skipped and the base segment's checkpoint
+   * version is used as the listing start point.
+   */
+  public LogSegment getLogSegmentForVersion(
+      Engine engine,
+      Optional<Long> timeTravelVersionOpt,
+      List<ParsedLogData> parsedLogDatas,
+      Optional<Long> maxCatalogVersionOpt,
+      Optional<LogSegment> baseLogSegmentOpt) {
     // This is the actual version we want to load. For "latest" (aka non-time-travel) queries for
     // catalogManaged tables we want to load the maxCatalogVersion
     final Optional<Long> versionToLoadOpt =
@@ -229,14 +244,24 @@ public class SnapshotManager {
     logger.info("Loading log segment for version {}", versionToLoadStr);
     final long logSegmentBuildingStartTimeMillis = System.currentTimeMillis();
 
-    ///////////////////////////////////////////////////////////////////////////////////////////
-    // Find the latest checkpoint version. If timeTravelVersionOpt is empty, use the        //
-    // version referenced by the _LAST_CHECKPOINT file. If timeTravelVersionOpt is present,  //
-    // search for the previous latest complete checkpoint at or before the version to load.  //
-    ///////////////////////////////////////////////////////////////////////////////////////////
+    ///////////////////////////////////////////////////////////////
+    // Find the starting checkpoint version. When a base        //
+    // LogSegment is provided (incremental path), skip the      //
+    // _last_checkpoint read and seed from the base's           //
+    // checkpoint version. Otherwise fall through to the cold   //
+    // path that reads _last_checkpoint or searches backwards.  //
+    ///////////////////////////////////////////////////////////////
 
-    final Optional<Long> startCheckpointVersionOpt =
-        getStartCheckpointVersion(engine, timeTravelVersionOpt, maxCatalogVersionOpt);
+    final Optional<Long> startCheckpointVersionOpt;
+    if (baseLogSegmentOpt.isPresent()) {
+      startCheckpointVersionOpt = baseLogSegmentOpt.get().getCheckpointVersionOpt();
+      logger.info(
+          "Incremental path: seeding from base " + "checkpoint version {}",
+          startCheckpointVersionOpt.map(String::valueOf).orElse("none"));
+    } else {
+      startCheckpointVersionOpt =
+          getStartCheckpointVersion(engine, timeTravelVersionOpt, maxCatalogVersionOpt);
+    }
 
     // Primary attempt to build the log segment
     Optional<LogSegment> result =

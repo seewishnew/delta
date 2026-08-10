@@ -48,6 +48,20 @@ public interface TableManager {
   }
 
   /**
+   * Creates a {@link SnapshotBuilder} seeded from an open snapshot for incremental log replay. The
+   * Engine is deferred to {@link SnapshotBuilder#build}, matching {@link #loadSnapshot(String)}.
+   *
+   * @param path the file system path to the Delta table
+   * @param baseSnapshot the existing snapshot to seed from
+   * @return a builder configured for incremental loading
+   */
+  static SnapshotBuilder builderFrom(String path, Snapshot baseSnapshot) {
+    SnapshotBuilderImpl builder = new SnapshotBuilderImpl(path);
+    builder.fromSnapshot(baseSnapshot);
+    return builder;
+  }
+
+  /**
    * Creates a {@link CreateTableTransactionBuilder} to build a create table transaction.
    *
    * @param path the file system path for the delta table being created

@@ -29,9 +29,14 @@ import io.delta.kernel.internal.checksum.CRCInfo;
 import io.delta.kernel.internal.checksum.ChecksumReader;
 import io.delta.kernel.internal.commit.DefaultFileSystemManagedTableOnlyCommitter;
 import io.delta.kernel.internal.files.ParsedCatalogCommitData;
+import io.delta.kernel.internal.files.ParsedCheckpointData;
+import io.delta.kernel.internal.files.ParsedChecksumData;
+import io.delta.kernel.internal.files.ParsedLogCompactionData;
 import io.delta.kernel.internal.files.ParsedLogData;
+import io.delta.kernel.internal.files.ParsedPublishedDeltaData;
 import io.delta.kernel.internal.fs.Path;
 import io.delta.kernel.internal.lang.Lazy;
+import io.delta.kernel.internal.lang.ListUtils;
 import io.delta.kernel.internal.metrics.SnapshotMetrics;
 import io.delta.kernel.internal.metrics.SnapshotQueryContext;
 import io.delta.kernel.internal.replay.LogReplay;
@@ -39,8 +44,13 @@ import io.delta.kernel.internal.replay.ProtocolMetadataLogReplay;
 import io.delta.kernel.internal.snapshot.LogSegment;
 import io.delta.kernel.internal.snapshot.SnapshotManager;
 import io.delta.kernel.internal.tablefeatures.TableFeatures;
+import io.delta.kernel.internal.util.FileNames;
 import io.delta.kernel.utils.FileStatus;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
@@ -186,9 +196,16 @@ public class SnapshotFactory {
     final Optional<Long> timeTravelVersion = getTargetTimeTravelVersion(engine, snapshotCtx);
     final Lazy<LogSegment> lazyLogSegment =
         getLazyLogSegment(engine, snapshotCtx, timeTravelVersion);
-    final Lazy<Optional<CRCInfo>> lazyCrcInfo =
-        createLazyChecksumFileLoaderWithMetrics(
-            engine, lazyLogSegment, snapshotCtx.getSnapshotMetrics());
+
+    final Lazy<Optional<CRCInfo>> lazyCrcInfo;
+    if (ctx.baseStateOpt.isPresent()) {
+      lazyCrcInfo =
+          createIncrementalCrcLoader(engine, lazyLogSegment, snapshotCtx.getSnapshotMetrics());
+    } else {
+      lazyCrcInfo =
+          createLazyChecksumFileLoaderWithMetrics(
+              engine, lazyLogSegment, snapshotCtx.getSnapshotMetrics());
+    }
 
     Protocol protocol;
     Metadata metadata;
@@ -240,6 +257,63 @@ public class SnapshotFactory {
 
   private Lazy<LogSegment> getLazyLogSegment(
       Engine engine, SnapshotQueryContext snapshotCtx, Optional<Long> timeTravelVersion) {
+
+    // Path A: preloaded log segment bypasses
+    // SnapshotManager entirely
+    if (!ctx.preloadedLogSegment.isEmpty()) {
+      return new Lazy<>(
+          () -> {
+            final Path logPath = new Path(tablePath, "_delta_log");
+            final LogSegment segment =
+                buildLogSegmentFromPreloadedData(logPath, ctx.preloadedLogSegment);
+            // Fix 3: validate preloaded segment version
+            // matches requested version if set
+            if (ctx.versionOpt.isPresent()) {
+              long segVer = segment.getVersion();
+              checkArgument(
+                  segVer == ctx.versionOpt.get(),
+                  "Preloaded segment version %s does " + "not match requested version %s",
+                  segVer,
+                  ctx.versionOpt.get());
+            }
+            snapshotCtx.setResolvedVersion(segment.getVersion());
+            snapshotCtx.setCheckpointVersion(segment.getCheckpointVersionOpt());
+            return segment;
+          });
+    }
+
+    // Path B: incremental from base (skips
+    // _last_checkpoint read)
+    if (ctx.baseStateOpt.isPresent()) {
+      final SnapshotBuilderImpl.CapturedBaseState baseState = ctx.baseStateOpt.get();
+      return new Lazy<>(
+          () -> {
+            // Fix 2: same-version short-circuit
+            if (timeTravelVersion.isPresent() && timeTravelVersion.get() == baseState.baseVersion) {
+              snapshotCtx.setResolvedVersion(baseState.baseVersion);
+              snapshotCtx.setCheckpointVersion(baseState.baseLogSegment.getCheckpointVersionOpt());
+              return baseState.baseLogSegment;
+            }
+            final SnapshotManager snapshotManager = new SnapshotManager(tablePath);
+            final LogSegment logSegment =
+                snapshotCtx
+                    .getSnapshotMetrics()
+                    .loadLogSegmentTotalDurationTimer
+                    .time(
+                        () ->
+                            snapshotManager.getLogSegmentForVersion(
+                                engine,
+                                timeTravelVersion,
+                                ctx.logDatas,
+                                ctx.maxCatalogVersion,
+                                Optional.of(baseState.baseLogSegment)));
+            snapshotCtx.setResolvedVersion(logSegment.getVersion());
+            snapshotCtx.setCheckpointVersion(logSegment.getCheckpointVersionOpt());
+            return logSegment;
+          });
+    }
+
+    // Path C: cold build (existing path)
     return new Lazy<>(
         () -> {
           final LogSegment logSegment =
@@ -251,10 +325,8 @@ public class SnapshotFactory {
                           new SnapshotManager(tablePath)
                               .getLogSegmentForVersion(
                                   engine, timeTravelVersion, ctx.logDatas, ctx.maxCatalogVersion));
-
           snapshotCtx.setResolvedVersion(logSegment.getVersion());
           snapshotCtx.setCheckpointVersion(logSegment.getCheckpointVersionOpt());
-
           return logSegment;
         });
   }
@@ -280,11 +352,116 @@ public class SnapshotFactory {
     if (isCatalogManaged) {
       checkArgument(
           ctx.maxCatalogVersion.isPresent(),
-          "Must provide maxCatalogVersion for catalogManaged tables");
+          "Must provide maxCatalogVersion for " + "catalogManaged tables");
     } else {
       checkArgument(
           !ctx.maxCatalogVersion.isPresent(),
-          "Should not provide maxCatalogVersion for file-system managed tables");
+          "Should not provide maxCatalogVersion for " + "file-system managed tables");
     }
+  }
+
+  /**
+   * CRC loader for incremental snapshot builds. Primary: the new log segment's {@code .crc} file.
+   * Fallback: eagerly captured base CRC (version-guarded).
+   */
+  private Lazy<Optional<CRCInfo>> createIncrementalCrcLoader(
+      Engine engine, Lazy<LogSegment> lazyLogSegment, SnapshotMetrics snapshotMetrics) {
+    final SnapshotBuilderImpl.CapturedBaseState baseState = ctx.baseStateOpt.get();
+    return new Lazy<>(
+        () -> {
+          final Optional<FileStatus> crcFileOpt = lazyLogSegment.get().getLastSeenChecksum();
+          if (crcFileOpt.isPresent()) {
+            return snapshotMetrics.loadCrcTotalDurationTimer.time(
+                () -> ChecksumReader.tryReadChecksumFile(engine, crcFileOpt.get()));
+          }
+          return baseState.baseCrcInfo.filter(c -> c.getVersion() == baseState.baseVersion);
+        });
+  }
+
+  /**
+   * Builds a {@link LogSegment} from pre-parsed log data, bypassing SnapshotManager's file listing
+   * entirely. Partitions the data by type, validates contiguity, and constructs the segment.
+   */
+  private static LogSegment buildLogSegmentFromPreloadedData(
+      Path logPath, List<ParsedLogData> data) {
+    checkArgument(!data.isEmpty(), "preloadedLogSegment must not be empty");
+
+    // Partition by category class
+    final Map<Class<? extends ParsedLogData>, List<ParsedLogData>> partitioned =
+        data.stream()
+            .collect(
+                Collectors.groupingBy(
+                    ParsedLogData::getGroupByCategoryClass,
+                    LinkedHashMap::new,
+                    Collectors.toList()));
+
+    // Extract deltas
+    final List<ParsedLogData> rawDeltas =
+        partitioned.getOrDefault(ParsedPublishedDeltaData.class, Collections.emptyList());
+    final List<FileStatus> deltaFiles =
+        rawDeltas.stream()
+            .filter(ParsedLogData::isFile)
+            .map(ParsedLogData::getFileStatus)
+            .collect(Collectors.toList());
+
+    // Extract checkpoints
+    final List<FileStatus> checkpointFiles =
+        partitioned.getOrDefault(ParsedCheckpointData.class, Collections.emptyList()).stream()
+            .map(ParsedLogData::getFileStatus)
+            .collect(Collectors.toList());
+
+    // Extract compactions
+    final List<FileStatus> compactionFiles =
+        partitioned.getOrDefault(ParsedLogCompactionData.class, Collections.emptyList()).stream()
+            .map(ParsedLogData::getFileStatus)
+            .collect(Collectors.toList());
+
+    // Warning 5: sort deltas by version for contiguity
+    deltaFiles.sort(Comparator.comparingLong(f -> FileNames.deltaVersion(new Path(f.getPath()))));
+
+    // Warning 6: pick checksum by max version
+    final List<ParsedLogData> checksums =
+        partitioned.getOrDefault(ParsedChecksumData.class, Collections.emptyList());
+    final Optional<FileStatus> lastSeenChecksum =
+        checksums.stream()
+            .max(Comparator.comparingLong(ParsedLogData::getVersion))
+            .map(ParsedLogData::getFileStatus);
+
+    // Fix 4: allow checkpoint-only segments
+    checkArgument(
+        !deltaFiles.isEmpty() || !checkpointFiles.isEmpty(),
+        "Preloaded segment must contain at least " + "delta files or checkpoint files");
+
+    // Determine version from last delta or checkpoint
+    final long version;
+    final FileStatus lastDelta;
+    if (!deltaFiles.isEmpty()) {
+      lastDelta = ListUtils.getLast(deltaFiles);
+      version = FileNames.deltaVersion(new Path(lastDelta.getPath()));
+    } else {
+      lastDelta = null;
+      version =
+          checkpointFiles.stream()
+              .mapToLong(f -> FileNames.getFileVersion(new Path(f.getPath())))
+              .max()
+              .getAsLong();
+    }
+
+    // Determine max published delta version
+    final Optional<Long> maxPublishedDeltaVersion =
+        rawDeltas.stream()
+            .filter(d -> d instanceof ParsedPublishedDeltaData)
+            .map(ParsedLogData::getVersion)
+            .max(Long::compareTo);
+
+    return new LogSegment(
+        logPath,
+        version,
+        deltaFiles,
+        compactionFiles,
+        checkpointFiles,
+        lastDelta,
+        lastSeenChecksum,
+        maxPublishedDeltaVersion);
   }
 }

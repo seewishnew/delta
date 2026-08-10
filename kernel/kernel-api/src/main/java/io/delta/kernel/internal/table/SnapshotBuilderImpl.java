@@ -27,9 +27,11 @@ import io.delta.kernel.internal.DeltaErrors;
 import io.delta.kernel.internal.SnapshotImpl;
 import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.actions.Protocol;
+import io.delta.kernel.internal.checksum.CRCInfo;
 import io.delta.kernel.internal.files.LogDataUtils;
 import io.delta.kernel.internal.files.ParsedLogData;
 import io.delta.kernel.internal.lang.ListUtils;
+import io.delta.kernel.internal.snapshot.LogSegment;
 import io.delta.kernel.internal.tablefeatures.TableFeatures;
 import io.delta.kernel.internal.util.Tuple2;
 import java.util.Collections;
@@ -45,6 +47,22 @@ import java.util.Optional;
  */
 public class SnapshotBuilderImpl implements SnapshotBuilder {
 
+  /**
+   * Eagerly captured state from a base {@link SnapshotImpl}. No reference to the original snapshot
+   * is retained.
+   */
+  public static class CapturedBaseState {
+    public final LogSegment baseLogSegment;
+    public final Optional<CRCInfo> baseCrcInfo;
+    public final long baseVersion;
+
+    CapturedBaseState(LogSegment baseLogSegment, Optional<CRCInfo> baseCrcInfo, long baseVersion) {
+      this.baseLogSegment = requireNonNull(baseLogSegment);
+      this.baseCrcInfo = requireNonNull(baseCrcInfo);
+      this.baseVersion = baseVersion;
+    }
+  }
+
   public static class Context {
     public final String unresolvedPath;
     public Optional<Long> versionOpt = Optional.empty();
@@ -53,6 +71,8 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
     public List<ParsedLogData> logDatas = Collections.emptyList();
     public Optional<Tuple2<Protocol, Metadata>> protocolAndMetadataOpt = Optional.empty();
     public Optional<Long> maxCatalogVersion = Optional.empty();
+    public Optional<CapturedBaseState> baseStateOpt = Optional.empty();
+    public List<ParsedLogData> preloadedLogSegment = Collections.emptyList();
 
     public Context(String unresolvedPath) {
       this.unresolvedPath = requireNonNull(unresolvedPath, "unresolvedPath is null");
@@ -114,6 +134,27 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
     return this;
   }
 
+  /**
+   * Seeds this builder from an existing snapshot for incremental log replay. Eagerly captures
+   * LogSegment, CRC, and version from the snapshot; the original snapshot reference is not
+   * retained.
+   */
+  public SnapshotBuilderImpl fromSnapshot(Snapshot snapshot) {
+    checkArgument(snapshot instanceof SnapshotImpl, "snapshot must be a SnapshotImpl");
+    SnapshotImpl impl = (SnapshotImpl) snapshot;
+    ctx.baseStateOpt =
+        Optional.of(
+            new CapturedBaseState(
+                impl.getLogSegment(), impl.getCurrentCrcInfo(), impl.getVersion()));
+    return this;
+  }
+
+  /** Provides a pre-parsed log segment to bypass SnapshotManager listing entirely. */
+  public SnapshotBuilderImpl withPreloadedLogSegment(List<ParsedLogData> logSegmentData) {
+    ctx.preloadedLogSegment = requireNonNull(logSegmentData);
+    return this;
+  }
+
   @Override
   public SnapshotImpl build(Engine engine) {
     validateInputOnBuild(engine);
@@ -129,6 +170,7 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
     validateVersionAndTimestampMutuallyExclusive();
     validateProtocolAndMetadataOnlyIfVersionProvided();
     validateProtocolRead();
+    validateBaseSnapshotVersionConstraint();
     // TODO: delta-io/delta#4765 support other types
     LogDataUtils.validateLogDataContainsOnlyRatifiedStagedCommits(ctx.logDatas);
     LogDataUtils.validateLogDataIsSortedContiguous(ctx.logDatas);
@@ -172,6 +214,20 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
   private void validateProtocolRead() {
     ctx.protocolAndMetadataOpt.ifPresent(
         x -> TableFeatures.validateKernelCanReadTheTable(x._1, ctx.unresolvedPath));
+  }
+
+  private void validateBaseSnapshotVersionConstraint() {
+    if (ctx.baseStateOpt.isPresent() && ctx.versionOpt.isPresent()) {
+      long baseVersion = ctx.baseStateOpt.get().baseVersion;
+      long requestedVersion = ctx.versionOpt.get();
+      checkArgument(
+          requestedVersion >= baseVersion,
+          String.format(
+              "Cannot build incremental snapshot at "
+                  + "version %d which is before base "
+                  + "snapshot version %d",
+              requestedVersion, baseVersion));
+    }
   }
 
   /**

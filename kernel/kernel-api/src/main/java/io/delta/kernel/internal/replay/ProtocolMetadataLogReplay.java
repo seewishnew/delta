@@ -58,6 +58,20 @@ public class ProtocolMetadataLogReplay {
     }
   }
 
+  /** Optional Protocol and Metadata changes found in an incremental segment tail. */
+  public static class TailResult {
+    public final Optional<Protocol> protocol;
+    public final Optional<Metadata> metadata;
+    private final long numDeltaFilesRead;
+
+    private TailResult(
+        Optional<Protocol> protocol, Optional<Metadata> metadata, long numDeltaFilesRead) {
+      this.protocol = protocol;
+      this.metadata = metadata;
+      this.numDeltaFilesRead = numDeltaFilesRead;
+    }
+  }
+
   /**
    * Loads the latest Protocol and Metadata from the log files in the given LogSegment.
    *
@@ -90,6 +104,30 @@ public class ProtocolMetadataLogReplay {
         logSegment.getVersion(),
         result.numDeltaFilesRead);
 
+    return result;
+  }
+
+  /**
+   * Loads only Protocol and Metadata changes from the supplied non-standalone segment tail.
+   *
+   * <p>Unlike {@link #loadProtocolAndMetadata}, absence of either action is a valid result: callers
+   * layer any discovered values over the retained base snapshot.
+   */
+  public static TailResult loadProtocolAndMetadataFromTail(
+      Engine engine, Path dataPath, LogSegment.Tail tail, SnapshotMetrics snapshotMetrics) {
+    final TailResult result =
+        snapshotMetrics.loadProtocolMetadataTotalDurationTimer.time(
+            () -> loadProtocolAndMetadataFromTailInternal(engine, tail));
+
+    result.protocol.ifPresent(
+        protocol -> TableFeatures.validateKernelCanReadTheTable(protocol, dataPath.toString()));
+    logger.info(
+        "[{}] Took {}ms to load incremental Protocol and Metadata through version {}, read {} "
+            + "log files",
+        dataPath,
+        snapshotMetrics.loadProtocolMetadataTotalDurationTimer.totalDurationMs(),
+        tail.getEndVersion(),
+        result.numDeltaFilesRead);
     return result;
   }
 
@@ -207,6 +245,49 @@ public class ProtocolMetadataLogReplay {
     }
 
     return new Result(protocol, metadata, numDeltaFilesRead);
+  }
+
+  private static TailResult loadProtocolAndMetadataFromTailInternal(
+      Engine engine, LogSegment.Tail tail) {
+    long numDeltaFilesRead = 0;
+    Protocol protocol = null;
+    Metadata metadata = null;
+
+    try (CloseableIterator<ActionWrapper> reverseIter =
+        new ActionsIterator(
+            engine, tail.getFilesReversed(), PROTOCOL_METADATA_READ_SCHEMA, Optional.empty())) {
+      while (reverseIter.hasNext() && (protocol == null || metadata == null)) {
+        final ActionWrapper nextElem = reverseIter.next();
+        numDeltaFilesRead++;
+        final ColumnarBatch batch = nextElem.getColumnarBatch();
+        assert (batch.getSchema().equals(PROTOCOL_METADATA_READ_SCHEMA));
+
+        if (protocol == null) {
+          final ColumnVector protocolVector = batch.getColumnVector(0);
+          for (int i = 0; i < protocolVector.getSize(); i++) {
+            if (!protocolVector.isNullAt(i)) {
+              protocol = Protocol.fromColumnVector(protocolVector, i);
+              break;
+            }
+          }
+        }
+
+        if (metadata == null) {
+          final ColumnVector metadataVector = batch.getColumnVector(1);
+          for (int i = 0; i < metadataVector.getSize(); i++) {
+            if (!metadataVector.isNullAt(i)) {
+              metadata = Metadata.fromColumnVector(metadataVector, i);
+              break;
+            }
+          }
+        }
+      }
+    } catch (IOException ex) {
+      throw new RuntimeException("Could not close iterator", ex);
+    }
+
+    return new TailResult(
+        Optional.ofNullable(protocol), Optional.ofNullable(metadata), numDeltaFilesRead);
   }
 
   private static void validateCrcInfoMatchesExpectedVersion(CRCInfo crcInfo, long expectedVersion) {

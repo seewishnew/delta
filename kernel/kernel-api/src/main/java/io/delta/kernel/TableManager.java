@@ -16,9 +16,13 @@
 
 package io.delta.kernel;
 
+import static io.delta.kernel.internal.util.Preconditions.checkArgument;
+import static java.util.Objects.requireNonNull;
+
 import io.delta.kernel.annotation.Experimental;
 import io.delta.kernel.internal.CreateTableTransactionBuilderImpl;
 import io.delta.kernel.internal.commitrange.CommitRangeBuilderImpl;
+import io.delta.kernel.internal.fs.Path;
 import io.delta.kernel.internal.table.SnapshotBuilderImpl;
 import io.delta.kernel.transaction.CreateTableTransactionBuilder;
 import io.delta.kernel.types.StructType;
@@ -51,14 +55,36 @@ public interface TableManager {
    * Creates a {@link SnapshotBuilder} seeded from an open snapshot for incremental log replay. The
    * Engine is deferred to {@link SnapshotBuilder#build}, matching {@link #loadSnapshot(String)}.
    *
+   * @param baseSnapshot the existing snapshot to seed from
+   * @return a builder configured for incremental loading
+   */
+  static SnapshotBuilder builderFrom(Snapshot baseSnapshot) {
+    requireNonNull(baseSnapshot, "baseSnapshot is null");
+    SnapshotBuilderImpl builder = new SnapshotBuilderImpl(baseSnapshot.getPath());
+    builder.fromSnapshot(baseSnapshot);
+    return builder;
+  }
+
+  /**
+   * Creates a {@link SnapshotBuilder} seeded from an open snapshot for incremental log replay.
+   *
+   * <p>This compatibility overload validates that {@code path} identifies the same table as {@code
+   * baseSnapshot}. Prefer {@link #builderFrom(Snapshot)} when the path is not otherwise needed by
+   * the caller.
+   *
    * @param path the file system path to the Delta table
    * @param baseSnapshot the existing snapshot to seed from
    * @return a builder configured for incremental loading
    */
   static SnapshotBuilder builderFrom(String path, Snapshot baseSnapshot) {
-    SnapshotBuilderImpl builder = new SnapshotBuilderImpl(path);
-    builder.fromSnapshot(baseSnapshot);
-    return builder;
+    requireNonNull(path, "path is null");
+    requireNonNull(baseSnapshot, "baseSnapshot is null");
+    checkArgument(
+        new Path(path).equals(new Path(baseSnapshot.getPath())),
+        "Path %s does not match base snapshot path %s",
+        path,
+        baseSnapshot.getPath());
+    return builderFrom(baseSnapshot);
   }
 
   /**

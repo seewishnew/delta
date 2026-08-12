@@ -42,6 +42,7 @@ import io.delta.kernel.internal.skipping.DataSkippingUtils;
 import io.delta.kernel.internal.util.*;
 import io.delta.kernel.metrics.ScanReport;
 import io.delta.kernel.metrics.SnapshotReport;
+import io.delta.kernel.types.DataType;
 import io.delta.kernel.types.MetadataColumnSpec;
 import io.delta.kernel.types.StructField;
 import io.delta.kernel.types.StructType;
@@ -92,7 +93,7 @@ public class ScanImpl implements Scan {
     this.metadata = metadata;
     this.logReplay = logReplay;
     this.filter = filter;
-    this.partitionAndDataFilters = splitFilters(filter);
+    this.partitionAndDataFilters = splitFilters(filter, metadata);
     this.dataPath = dataPath;
     this.partitionColToStructFieldMap =
         () -> {
@@ -195,12 +196,16 @@ public class ScanImpl implements Scan {
               paginationContextOpt);
 
       // Apply partition pruning
-      scanFileIter = applyPartitionPruning(engine, scanFileIter);
+      scanFileIter =
+          applyPartitionPruning(
+              engine, scanFileIter, getPartitionsFilters(), partitionColToStructFieldMap.get());
 
       // Apply data skipping
       if (hasDataSkippingFilter) {
         // there was a usable data skipping filter --> apply data skipping
-        scanFileIter = applyDataSkipping(engine, scanFileIter, dataSkippingFilter.get());
+        scanFileIter =
+            applyDataSkipping(
+                engine, scanFileIter, dataSkippingFilter.get(), metadata.getDataSchema());
       }
 
       // TODO when !includeStats drop the stats column if present before returning
@@ -289,7 +294,8 @@ public class ScanImpl implements Scan {
     return Collections.singletonList(logicalField);
   }
 
-  private Optional<Tuple2<Predicate, Predicate>> splitFilters(Optional<Predicate> filter) {
+  static Optional<Tuple2<Predicate, Predicate>> splitFilters(
+      Optional<Predicate> filter, Metadata metadata) {
     return filter.map(
         predicate ->
             PartitionUtils.splitMetadataAndDataPredicates(
@@ -297,21 +303,33 @@ public class ScanImpl implements Scan {
   }
 
   private Optional<Predicate> getDataFilters() {
-    return removeAlwaysTrue(partitionAndDataFilters.map(filters -> filters._2));
+    return getDataFilters(partitionAndDataFilters);
   }
 
   private Optional<Predicate> getPartitionsFilters() {
+    return getPartitionFilters(partitionAndDataFilters);
+  }
+
+  static Optional<Predicate> getDataFilters(
+      Optional<Tuple2<Predicate, Predicate>> partitionAndDataFilters) {
+    return removeAlwaysTrue(partitionAndDataFilters.map(filters -> filters._2));
+  }
+
+  static Optional<Predicate> getPartitionFilters(
+      Optional<Tuple2<Predicate, Predicate>> partitionAndDataFilters) {
     return removeAlwaysTrue(partitionAndDataFilters.map(filters -> filters._1));
   }
 
   /** Consider `ALWAYS_TRUE` as no predicate. */
-  private Optional<Predicate> removeAlwaysTrue(Optional<Predicate> predicate) {
+  private static Optional<Predicate> removeAlwaysTrue(Optional<Predicate> predicate) {
     return predicate.filter(filter -> !filter.getName().equalsIgnoreCase("ALWAYS_TRUE"));
   }
 
-  private CloseableIterator<FilteredColumnarBatch> applyPartitionPruning(
-      Engine engine, CloseableIterator<FilteredColumnarBatch> scanFileIter) {
-    Optional<Predicate> partitionPredicate = getPartitionsFilters();
+  static CloseableIterator<FilteredColumnarBatch> applyPartitionPruning(
+      Engine engine,
+      CloseableIterator<FilteredColumnarBatch> scanFileIter,
+      Optional<Predicate> partitionPredicate,
+      Map<String, StructField> partitionColToStructFieldMap) {
     if (!partitionPredicate.isPresent()) {
       // There is no partition filter, return the scan file iterator as is.
       return scanFileIter;
@@ -319,7 +337,7 @@ public class ScanImpl implements Scan {
 
     Predicate predicateOnScanFileBatch =
         rewritePartitionPredicateOnScanFileSchema(
-            partitionPredicate.get(), partitionColToStructFieldMap.get());
+            partitionPredicate.get(), partitionColToStructFieldMap);
 
     return new CloseableIterator<FilteredColumnarBatch>() {
       PredicateEvaluator predicateEvaluator = null;
@@ -360,24 +378,28 @@ public class ScanImpl implements Scan {
     };
   }
 
-  private Optional<DataSkippingPredicate> getDataSkippingFilter() {
-    return getDataFilters()
-        .flatMap(
-            dataFilters ->
-                DataSkippingUtils.constructDataSkippingFilter(
-                    dataFilters, metadata.getDataSchema()));
+  static Optional<DataSkippingPredicate> getDataSkippingFilter(
+      Optional<Predicate> dataFilters, Metadata metadata) {
+    return dataFilters.flatMap(
+        predicate ->
+            DataSkippingUtils.constructDataSkippingFilter(predicate, metadata.getDataSchema()));
   }
 
-  private CloseableIterator<FilteredColumnarBatch> applyDataSkipping(
+  private Optional<DataSkippingPredicate> getDataSkippingFilter() {
+    return getDataSkippingFilter(getDataFilters(), metadata);
+  }
+
+  static CloseableIterator<FilteredColumnarBatch> applyDataSkipping(
       Engine engine,
       CloseableIterator<FilteredColumnarBatch> scanFileIter,
-      DataSkippingPredicate dataSkippingFilter) {
+      DataSkippingPredicate dataSkippingFilter,
+      StructType dataSchema) {
     // Get the stats schema
     // It's possible to instead provide the referenced columns when building the schema but
     // pruning it after is much simpler
     StructType prunedStatsSchema =
         DataSkippingUtils.pruneStatsSchema(
-            getStatsSchema(metadata.getDataSchema(), dataSkippingFilter.getReferencedCollations()),
+            getStatsSchema(dataSchema, dataSkippingFilter.getReferencedCollations()),
             dataSkippingFilter.getReferencedCols());
     logger.info("For stats JSON parsing: prunedStatsSchema={}", prunedStatsSchema);
 
@@ -418,6 +440,28 @@ public class ScanImpl implements Scan {
           return new FilteredColumnarBatch(
               filteredScanFileBatch.getData(), Optional.of(newSelectionVector));
         });
+  }
+
+  static void validateFilterReferences(Optional<Predicate> filter, StructType tableSchema) {
+    filter.ifPresent(predicate -> validateExpressionReferences(predicate, tableSchema));
+  }
+
+  private static void validateExpressionReferences(Expression expression, StructType tableSchema) {
+    if (expression instanceof Column) {
+      validateColumnReference((Column) expression, tableSchema);
+    }
+    expression.getChildren().forEach(child -> validateExpressionReferences(child, tableSchema));
+  }
+
+  private static void validateColumnReference(Column column, StructType tableSchema) {
+    DataType currentType = tableSchema;
+    for (String name : column.getNames()) {
+      if (!(currentType instanceof StructType) || ((StructType) currentType).indexOf(name) < 0) {
+        throw new IllegalArgumentException(
+            String.format("Column %s is not present in the table schema", column));
+      }
+      currentType = ((StructType) currentType).get(name).getDataType();
+    }
   }
 
   /**

@@ -19,6 +19,7 @@ package io.delta.kernel.internal.table;
 import static io.delta.kernel.internal.util.Preconditions.checkArgument;
 import static io.delta.kernel.internal.util.Utils.resolvePath;
 
+import io.delta.kernel.IncrementalReplay;
 import io.delta.kernel.Snapshot;
 import io.delta.kernel.engine.Engine;
 import io.delta.kernel.internal.DeltaHistoryManager;
@@ -27,6 +28,7 @@ import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.actions.Protocol;
 import io.delta.kernel.internal.checksum.CRCInfo;
 import io.delta.kernel.internal.checksum.ChecksumReader;
+import io.delta.kernel.internal.checksum.ChecksumUtils;
 import io.delta.kernel.internal.commit.DefaultFileSystemManagedTableOnlyCommitter;
 import io.delta.kernel.internal.files.ParsedCatalogCommitData;
 import io.delta.kernel.internal.files.ParsedCheckpointData;
@@ -39,13 +41,16 @@ import io.delta.kernel.internal.lang.Lazy;
 import io.delta.kernel.internal.lang.ListUtils;
 import io.delta.kernel.internal.metrics.SnapshotMetrics;
 import io.delta.kernel.internal.metrics.SnapshotQueryContext;
+import io.delta.kernel.internal.metrics.SnapshotReportImpl;
 import io.delta.kernel.internal.replay.LogReplay;
 import io.delta.kernel.internal.replay.ProtocolMetadataLogReplay;
 import io.delta.kernel.internal.snapshot.LogSegment;
 import io.delta.kernel.internal.snapshot.SnapshotManager;
 import io.delta.kernel.internal.tablefeatures.TableFeatures;
 import io.delta.kernel.internal.util.FileNames;
+import io.delta.kernel.internal.util.Tuple2;
 import io.delta.kernel.utils.FileStatus;
+import java.io.IOException;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -183,7 +188,14 @@ public class SnapshotFactory {
 
       engine
           .getMetricsReporters()
-          .forEach(reporter -> reporter.report(snapshot.getSnapshotReport()));
+          .forEach(
+              reporter ->
+                  reporter.report(
+                      ctx.baseSnapshotOpt
+                              .filter(baseSnapshot -> baseSnapshot == snapshot)
+                              .isPresent()
+                          ? SnapshotReportImpl.forSuccess(snapshotCtx)
+                          : snapshot.getSnapshotReport()));
 
       return snapshot;
     } catch (Exception e) {
@@ -194,17 +206,36 @@ public class SnapshotFactory {
 
   private SnapshotImpl createSnapshot(Engine engine, SnapshotQueryContext snapshotCtx) {
     final Optional<Long> timeTravelVersion = getTargetTimeTravelVersion(engine, snapshotCtx);
+    final Optional<Long> effectiveTarget =
+        timeTravelVersion.isPresent() ? timeTravelVersion : ctx.maxCatalogVersion;
+    final boolean builtAsLatest =
+        !ctx.timestampQueryContextOpt.isPresent()
+            && (!ctx.versionOpt.isPresent() || ctx.versionOpt.equals(ctx.maxCatalogVersion));
+
+    if (ctx.baseSnapshotOpt.isPresent() && ctx.preloadedLogSegment.isEmpty()) {
+      return createIncrementalSnapshot(
+          engine, snapshotCtx, ctx.baseSnapshotOpt.get(), effectiveTarget, builtAsLatest);
+    }
+
     final Lazy<LogSegment> lazyLogSegment =
         getLazyLogSegment(engine, snapshotCtx, timeTravelVersion);
-
     final Lazy<Optional<CRCInfo>> lazyCrcInfo;
-    if (ctx.baseStateOpt.isPresent()) {
-      lazyCrcInfo =
-          createIncrementalCrcLoader(engine, lazyLogSegment, snapshotCtx.getSnapshotMetrics());
-    } else {
+    final Optional<CRCInfo> targetCrcInfo;
+    if (ctx.protocolAndMetadataOpt.isPresent()
+        && ctx.incrementalReplay.equals(IncrementalReplay.disabled())) {
       lazyCrcInfo =
           createLazyChecksumFileLoaderWithMetrics(
               engine, lazyLogSegment, snapshotCtx.getSnapshotMetrics());
+      targetCrcInfo = Optional.empty();
+    } else {
+      final LogSegment logSegment = lazyLogSegment.get();
+      lazyCrcInfo =
+          selectAndAdvanceCrc(
+              engine,
+              logSegment,
+              Optional.empty() /* inMemoryBase */,
+              snapshotCtx.getSnapshotMetrics());
+      targetCrcInfo = lazyCrcInfo.get().filter(crc -> crc.getVersion() == logSegment.getVersion());
     }
 
     Protocol protocol;
@@ -213,6 +244,9 @@ public class SnapshotFactory {
     if (ctx.protocolAndMetadataOpt.isPresent()) {
       protocol = ctx.protocolAndMetadataOpt.get()._1;
       metadata = ctx.protocolAndMetadataOpt.get()._2;
+    } else if (targetCrcInfo.isPresent()) {
+      protocol = targetCrcInfo.get().getProtocol();
+      metadata = targetCrcInfo.get().getMetadata();
     } else {
       ProtocolMetadataLogReplay.Result result =
           ProtocolMetadataLogReplay.loadProtocolAndMetadata(
@@ -241,7 +275,226 @@ public class SnapshotFactory {
         metadata,
         ctx.committerOpt.orElse(DefaultFileSystemManagedTableOnlyCommitter.INSTANCE),
         snapshotCtx,
-        Optional.empty() /* inCommitTimestampOpt */);
+        Optional.empty() /* inCommitTimestampOpt */,
+        builtAsLatest);
+  }
+
+  private SnapshotImpl createIncrementalSnapshot(
+      Engine engine,
+      SnapshotQueryContext snapshotCtx,
+      SnapshotImpl baseSnapshot,
+      Optional<Long> effectiveTarget,
+      boolean builtAsLatest) {
+    if (effectiveTarget.isPresent() && effectiveTarget.get() == baseSnapshot.getVersion()) {
+      snapshotCtx.setResolvedVersion(baseSnapshot.getVersion());
+      snapshotCtx.setCheckpointVersion(baseSnapshot.getLogSegment().getCheckpointVersionOpt());
+      return baseSnapshot;
+    }
+
+    final Optional<LogSegment> logSegmentOpt =
+        snapshotCtx
+            .getSnapshotMetrics()
+            .loadLogSegmentTotalDurationTimer
+            .time(
+                () ->
+                    new IncrementalSnapshotLoader(tablePath)
+                        .loadLogSegment(engine, baseSnapshot, ctx.logDatas, effectiveTarget));
+
+    if (!logSegmentOpt.isPresent()) {
+      snapshotCtx.setResolvedVersion(baseSnapshot.getVersion());
+      snapshotCtx.setCheckpointVersion(baseSnapshot.getLogSegment().getCheckpointVersionOpt());
+      return builtAsLatest ? baseSnapshot.promoteToBuiltAsLatest(snapshotCtx) : baseSnapshot;
+    }
+
+    final LogSegment logSegment = logSegmentOpt.get();
+    snapshotCtx.setResolvedVersion(logSegment.getVersion());
+    snapshotCtx.setCheckpointVersion(logSegment.getCheckpointVersionOpt());
+    final boolean rebuild =
+        logSegment
+            .getCheckpointVersionOpt()
+            .map(checkpointVersion -> checkpointVersion > baseSnapshot.getVersion())
+            .orElse(false);
+    return createSnapshotFromSegment(
+        engine,
+        snapshotCtx,
+        logSegment,
+        ctx.protocolAndMetadataOpt,
+        builtAsLatest,
+        baseSnapshot,
+        rebuild);
+  }
+
+  private SnapshotImpl createSnapshotFromSegment(
+      Engine engine,
+      SnapshotQueryContext snapshotCtx,
+      LogSegment logSegment,
+      Optional<Tuple2<Protocol, Metadata>> protocolAndMetadataOpt,
+      boolean builtAsLatest,
+      SnapshotImpl baseSnapshot,
+      boolean rebuild) {
+    final Lazy<LogSegment> lazyLogSegment = new Lazy<>(() -> logSegment);
+    if (!rebuild && logSegment.getVersion() == baseSnapshot.getVersion()) {
+      final Optional<CRCInfo> loadedBaseCrc =
+          getEligibleCrc(logSegment, baseSnapshot.getLoadedCrcInfo());
+      final Lazy<Optional<CRCInfo>> lazyCrcInfo;
+      if (getPreferredDiskCrc(logSegment, loadedBaseCrc).isPresent()) {
+        lazyCrcInfo =
+            new Lazy<>(
+                () ->
+                    pickLatestBaseCrc(
+                        engine, logSegment, loadedBaseCrc, snapshotCtx.getSnapshotMetrics()));
+      } else {
+        lazyCrcInfo = materializedCrcLazy(loadedBaseCrc);
+      }
+      final LogReplay logReplay = new LogReplay(engine, tablePath, lazyLogSegment, lazyCrcInfo);
+      return new SnapshotImpl(
+          tablePath,
+          logSegment.getVersion(),
+          lazyLogSegment,
+          logReplay,
+          baseSnapshot.getProtocol(),
+          baseSnapshot.getMetadata(),
+          ctx.committerOpt.orElse(baseSnapshot.getCommitter()),
+          snapshotCtx,
+          Optional.empty() /* inCommitTimestampOpt */,
+          builtAsLatest);
+    }
+
+    final Lazy<Optional<CRCInfo>> lazyCrcInfo;
+    final Optional<CRCInfo> baseCrcInfo;
+    final Optional<CRCInfo> targetCrcInfo;
+    if (protocolAndMetadataOpt.isPresent()
+        && ctx.incrementalReplay.equals(IncrementalReplay.disabled())) {
+      lazyCrcInfo =
+          createLazyChecksumFileLoaderWithMetrics(
+              engine, lazyLogSegment, snapshotCtx.getSnapshotMetrics());
+      baseCrcInfo = Optional.empty();
+      targetCrcInfo = Optional.empty();
+    } else {
+      lazyCrcInfo =
+          selectAndAdvanceCrc(
+              engine,
+              logSegment,
+              rebuild ? Optional.empty() : baseSnapshot.getLoadedCrcInfo(),
+              snapshotCtx.getSnapshotMetrics());
+      baseCrcInfo = lazyCrcInfo.get();
+      targetCrcInfo = baseCrcInfo.filter(crc -> crc.getVersion() == logSegment.getVersion());
+    }
+
+    final Protocol protocol;
+    final Metadata metadata;
+    if (protocolAndMetadataOpt.isPresent()) {
+      protocol = protocolAndMetadataOpt.get()._1;
+      metadata = protocolAndMetadataOpt.get()._2;
+    } else if (targetCrcInfo.isPresent()) {
+      protocol = targetCrcInfo.get().getProtocol();
+      metadata = targetCrcInfo.get().getMetadata();
+    } else if (rebuild) {
+      ProtocolMetadataLogReplay.Result result =
+          ProtocolMetadataLogReplay.loadProtocolAndMetadata(
+              engine, tablePath, logSegment, lazyCrcInfo, snapshotCtx.getSnapshotMetrics());
+      protocol = result.protocol;
+      metadata = result.metadata;
+    } else {
+      final Optional<CRCInfo> newerBaseCrc =
+          baseCrcInfo.filter(crc -> crc.getVersion() > baseSnapshot.getVersion());
+      final long replayAfter =
+          newerBaseCrc.map(CRCInfo::getVersion).orElse(baseSnapshot.getVersion());
+      final ProtocolMetadataLogReplay.TailResult tailResult =
+          ProtocolMetadataLogReplay.loadProtocolAndMetadataFromTail(
+              engine,
+              tablePath,
+              logSegment.segmentAfterVersion(replayAfter),
+              snapshotCtx.getSnapshotMetrics());
+      protocol =
+          tailResult.protocol.orElseGet(
+              () -> newerBaseCrc.map(CRCInfo::getProtocol).orElse(baseSnapshot.getProtocol()));
+      metadata =
+          tailResult.metadata.orElseGet(
+              () -> newerBaseCrc.map(CRCInfo::getMetadata).orElse(baseSnapshot.getMetadata()));
+    }
+
+    TableFeatures.validateKernelCanReadTheTable(protocol, tablePath.toString());
+    validateMaxCatalogVersionPresence(protocol);
+    final LogReplay logReplay = new LogReplay(engine, tablePath, lazyLogSegment, lazyCrcInfo);
+    return new SnapshotImpl(
+        tablePath,
+        logSegment.getVersion(),
+        lazyLogSegment,
+        logReplay,
+        protocol,
+        metadata,
+        ctx.committerOpt.orElse(baseSnapshot.getCommitter()),
+        snapshotCtx,
+        Optional.empty() /* inCommitTimestampOpt */,
+        builtAsLatest);
+  }
+
+  private Optional<CRCInfo> pickLatestBaseCrc(
+      Engine engine,
+      LogSegment logSegment,
+      Optional<CRCInfo> inMemoryBase,
+      SnapshotMetrics snapshotMetrics) {
+    final Optional<CRCInfo> eligibleInMemoryBase = getEligibleCrc(logSegment, inMemoryBase);
+    final Optional<FileStatus> preferredDiskCrc =
+        getPreferredDiskCrc(logSegment, eligibleInMemoryBase);
+    final Optional<CRCInfo> selected =
+        preferredDiskCrc
+            .flatMap(
+                file ->
+                    snapshotMetrics.loadCrcTotalDurationTimer.time(
+                        () -> ChecksumReader.tryReadChecksumFile(engine, file)))
+            .map(Optional::of)
+            .orElse(eligibleInMemoryBase);
+    return getEligibleCrc(logSegment, selected);
+  }
+
+  private Lazy<Optional<CRCInfo>> selectAndAdvanceCrc(
+      Engine engine,
+      LogSegment logSegment,
+      Optional<CRCInfo> inMemoryBase,
+      SnapshotMetrics snapshotMetrics) {
+    final Optional<CRCInfo> baseCrcInfo =
+        pickLatestBaseCrc(engine, logSegment, inMemoryBase, snapshotMetrics);
+    Optional<CRCInfo> targetCrcInfo =
+        baseCrcInfo.filter(crc -> crc.getVersion() == logSegment.getVersion());
+    if (!targetCrcInfo.isPresent()
+        && baseCrcInfo.isPresent()
+        && ctx.incrementalReplay.allowsAdvancing(
+            baseCrcInfo.get().getVersion(), logSegment.getVersion())) {
+      try {
+        targetCrcInfo = ChecksumUtils.tryBuildCrcIncrementally(engine, logSegment, baseCrcInfo);
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to advance CRC incrementally", e);
+      }
+    }
+    return materializedCrcLazy(targetCrcInfo.isPresent() ? targetCrcInfo : baseCrcInfo);
+  }
+
+  private static Optional<CRCInfo> getEligibleCrc(
+      LogSegment logSegment, Optional<CRCInfo> crcInfo) {
+    final long targetVersion = logSegment.getVersion();
+    final Optional<Long> checkpointVersion = logSegment.getCheckpointVersionOpt();
+    return crcInfo
+        .filter(crc -> crc.getVersion() <= targetVersion)
+        .filter(
+            crc -> !checkpointVersion.isPresent() || crc.getVersion() >= checkpointVersion.get());
+  }
+
+  private static Optional<FileStatus> getPreferredDiskCrc(
+      LogSegment logSegment, Optional<CRCInfo> inMemoryBase) {
+    return logSegment
+        .getLastSeenChecksum()
+        .filter(
+            file ->
+                !inMemoryBase.isPresent()
+                    || FileNames.checksumVersion(file.getPath()) > inMemoryBase.get().getVersion());
+  }
+
+  private static Lazy<Optional<CRCInfo>> materializedCrcLazy(Optional<CRCInfo> crcInfo) {
+    final Lazy<Optional<CRCInfo>> lazyCrcInfo = new Lazy<>(() -> crcInfo);
+    lazyCrcInfo.get();
+    return lazyCrcInfo;
   }
 
   private SnapshotQueryContext getSnapshotQueryContext() {
@@ -282,38 +535,7 @@ public class SnapshotFactory {
           });
     }
 
-    // Path B: incremental from base (skips
-    // _last_checkpoint read)
-    if (ctx.baseStateOpt.isPresent()) {
-      final SnapshotBuilderImpl.CapturedBaseState baseState = ctx.baseStateOpt.get();
-      return new Lazy<>(
-          () -> {
-            // Fix 2: same-version short-circuit
-            if (timeTravelVersion.isPresent() && timeTravelVersion.get() == baseState.baseVersion) {
-              snapshotCtx.setResolvedVersion(baseState.baseVersion);
-              snapshotCtx.setCheckpointVersion(baseState.baseLogSegment.getCheckpointVersionOpt());
-              return baseState.baseLogSegment;
-            }
-            final SnapshotManager snapshotManager = new SnapshotManager(tablePath);
-            final LogSegment logSegment =
-                snapshotCtx
-                    .getSnapshotMetrics()
-                    .loadLogSegmentTotalDurationTimer
-                    .time(
-                        () ->
-                            snapshotManager.getLogSegmentForVersion(
-                                engine,
-                                timeTravelVersion,
-                                ctx.logDatas,
-                                ctx.maxCatalogVersion,
-                                Optional.of(baseState.baseLogSegment)));
-            snapshotCtx.setResolvedVersion(logSegment.getVersion());
-            snapshotCtx.setCheckpointVersion(logSegment.getCheckpointVersionOpt());
-            return logSegment;
-          });
-    }
-
-    // Path C: cold build (existing path)
+    // Path B: cold build (existing path)
     return new Lazy<>(
         () -> {
           final LogSegment logSegment =
@@ -358,24 +580,6 @@ public class SnapshotFactory {
           !ctx.maxCatalogVersion.isPresent(),
           "Should not provide maxCatalogVersion for " + "file-system managed tables");
     }
-  }
-
-  /**
-   * CRC loader for incremental snapshot builds. Primary: the new log segment's {@code .crc} file.
-   * Fallback: eagerly captured base CRC (version-guarded).
-   */
-  private Lazy<Optional<CRCInfo>> createIncrementalCrcLoader(
-      Engine engine, Lazy<LogSegment> lazyLogSegment, SnapshotMetrics snapshotMetrics) {
-    final SnapshotBuilderImpl.CapturedBaseState baseState = ctx.baseStateOpt.get();
-    return new Lazy<>(
-        () -> {
-          final Optional<FileStatus> crcFileOpt = lazyLogSegment.get().getLastSeenChecksum();
-          if (crcFileOpt.isPresent()) {
-            return snapshotMetrics.loadCrcTotalDurationTimer.time(
-                () -> ChecksumReader.tryReadChecksumFile(engine, crcFileOpt.get()));
-          }
-          return baseState.baseCrcInfo.filter(c -> c.getVersion() == baseState.baseVersion);
-        });
   }
 
   /**

@@ -17,12 +17,12 @@ package io.delta.kernel.internal.replay;
 
 import static io.delta.kernel.internal.util.Preconditions.checkArgument;
 
+import io.delta.kernel.FileActionKey;
 import io.delta.kernel.data.ColumnVector;
 import io.delta.kernel.data.ColumnarBatch;
 import io.delta.kernel.internal.actions.AddFile;
 import io.delta.kernel.internal.actions.DeletionVectorDescriptor;
 import io.delta.kernel.internal.actions.RemoveFile;
-import io.delta.kernel.internal.util.Tuple2;
 import io.delta.kernel.types.DataType;
 import io.delta.kernel.types.StructType;
 import java.net.URI;
@@ -33,33 +33,23 @@ public class LogReplayUtils {
 
   private LogReplayUtils() {}
 
-  public static class UniqueFileActionTuple extends Tuple2<URI, Optional<String>> {
-    UniqueFileActionTuple(URI fileURI, Optional<String> deletionVectorId) {
-      super(fileURI, deletionVectorId);
-    }
-  }
-
-  public static UniqueFileActionTuple getUniqueFileAction(
+  public static FileActionKey getFileActionKey(
       ColumnVector pathVector, ColumnVector dvVector, int rowId) {
     final String path = pathVector.getString(rowId);
-    final URI pathAsUri = pathToUri(path);
     final Optional<String> dvId =
         Optional.ofNullable(DeletionVectorDescriptor.fromColumnVector(dvVector, rowId))
             .map(DeletionVectorDescriptor::getUniqueId);
-
-    return new UniqueFileActionTuple(pathAsUri, dvId);
+    return new FileActionKey(pathToUri(path), dvId);
   }
 
-  /** Builds the unique file-action key for a materialized {@link AddFile}. */
-  public static UniqueFileActionTuple getUniqueFileAction(AddFile addFile) {
-    return new UniqueFileActionTuple(
+  public static FileActionKey getFileActionKey(AddFile addFile) {
+    return new FileActionKey(
         pathToUri(addFile.getPath()),
         addFile.getDeletionVector().map(DeletionVectorDescriptor::getUniqueId));
   }
 
-  /** Builds the unique file-action key for a materialized {@link RemoveFile}. */
-  public static UniqueFileActionTuple getUniqueFileAction(RemoveFile removeFile) {
-    return new UniqueFileActionTuple(
+  public static FileActionKey getFileActionKey(RemoveFile removeFile) {
+    return new FileActionKey(
         pathToUri(removeFile.getPath()),
         removeFile.getDeletionVector().map(DeletionVectorDescriptor::getUniqueId));
   }

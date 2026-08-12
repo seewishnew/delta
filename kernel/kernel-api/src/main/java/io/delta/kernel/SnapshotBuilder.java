@@ -118,6 +118,19 @@ public interface SnapshotBuilder {
   SnapshotBuilder withProtocolAndMetadata(Protocol protocol, Metadata metadata);
 
   /**
+   * Configures whether and how far Kernel may replay commits during snapshot construction to
+   * advance a stale checksum to the target version.
+   *
+   * <p>This setting does not control incremental snapshot loading itself or later explicit
+   * statistics computation. It only bounds optional checksum advancement during construction. The
+   * default is {@link IncrementalReplay#disabled()}.
+   *
+   * @param incrementalReplay checksum replay policy
+   * @return this builder configured with the provided policy
+   */
+  SnapshotBuilder withIncrementalCrcReplay(IncrementalReplay incrementalReplay);
+
+  /**
    * Specifies the maximum table version known by the catalog.
    *
    * <p>This method is used by catalog implementations for catalog-managed Delta tables to indicate

@@ -178,6 +178,16 @@ public class LogReplay {
   }
 
   /**
+   * Returns the last-seen CRC only if it has already been loaded.
+   *
+   * <p>This never evaluates the lazy CRC loader, which may retain the engine used to construct an
+   * older snapshot.
+   */
+  public Optional<CRCInfo> getLoadedLastSeenCrcInfo() {
+    return lazyLatestCrcInfo.isPresent() ? lazyLatestCrcInfo.get() : Optional.empty();
+  }
+
+  /**
    * Returns the CRC info for the current snapshot version if available. Lazily loads and caches the
    * CRC file on first access. Returns empty if no CRC file exists at the snapshot version.
    */

@@ -19,6 +19,7 @@ import static io.delta.kernel.internal.actions.SingleAction.CHECKPOINT_SCHEMA;
 import static io.delta.kernel.internal.util.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 
+import io.delta.kernel.FileActionKey;
 import io.delta.kernel.data.ColumnVector;
 import io.delta.kernel.data.ColumnarBatch;
 import io.delta.kernel.data.FilteredColumnarBatch;
@@ -32,7 +33,6 @@ import io.delta.kernel.internal.replay.ActionWrapper;
 import io.delta.kernel.internal.replay.ActionsIterator;
 import io.delta.kernel.internal.replay.CreateCheckpointIterator;
 import io.delta.kernel.internal.replay.LogReplayUtils;
-import io.delta.kernel.internal.replay.LogReplayUtils.UniqueFileActionTuple;
 import io.delta.kernel.internal.snapshot.LogSegment;
 import io.delta.kernel.internal.stats.FileSizeHistogram;
 import io.delta.kernel.internal.tablefeatures.TableFeatures;
@@ -426,7 +426,7 @@ public class ChecksumUtils {
               baseFiles -> {
                 state.collectAllFiles = true;
                 baseFiles.forEach(
-                    f -> state.addFilesByIdentity.put(LogReplayUtils.getUniqueFileAction(f), f));
+                    f -> state.addFilesByIdentity.put(LogReplayUtils.getFileActionKey(f), f));
               });
     }
 
@@ -520,7 +520,7 @@ public class ChecksumUtils {
 
             if (state.collectAllFiles) {
               RemoveFile removeFile = new RemoveFile(StructRow.fromStructVector(removeVector, i));
-              state.removeAddFile(LogReplayUtils.getUniqueFileAction(removeFile));
+              state.removeAddFile(LogReplayUtils.getFileActionKey(removeFile));
             }
           }
 
@@ -724,12 +724,12 @@ public class ChecksumUtils {
     LongAdder numDeletionVectors = new LongAdder();
     LongAdder numDeletedRecords = new LongAdder();
 
-    // AddFiles logic. Keyed on UniqueFileActionTuple (path URI, deletionVectorId) -- the same
+    // AddFiles logic. Keyed on FileActionKey (path URI, deletionVectorId) -- the same
     // file identity used by log replay -- so an add-with-new-DV and a remove-of-the-old-file for
     // the same path are distinct entries.
-    final Map<UniqueFileActionTuple, AddFile> addFilesByIdentity = new LinkedHashMap<>();
+    final Map<FileActionKey, AddFile> addFilesByIdentity = new LinkedHashMap<>();
     // We are iterating in reverse, so we track already seen so most recent actions take precedence.
-    final Set<UniqueFileActionTuple> seenIdentities = new HashSet<>();
+    final Set<FileActionKey> seenIdentities = new HashSet<>();
     boolean collectAllFiles = false;
     long allFilesThreshold = CRCInfo.DEFAULT_ALL_FILES_IN_CRC_THRESHOLD;
 
@@ -759,7 +759,7 @@ public class ChecksumUtils {
       if (!collectAllFiles) {
         return;
       }
-      UniqueFileActionTuple identity = LogReplayUtils.getUniqueFileAction(addFile);
+      FileActionKey identity = LogReplayUtils.getFileActionKey(addFile);
       // Don't record if a later action for this identity has already been seen.
       if (!markSeen(identity)) {
         return;
@@ -771,7 +771,7 @@ public class ChecksumUtils {
     }
 
     /** Removes a live AddFile by (path, dv) identity if collecting. */
-    void removeAddFile(UniqueFileActionTuple identity) {
+    void removeAddFile(FileActionKey identity) {
       if (!collectAllFiles) {
         return;
       }
@@ -791,7 +791,7 @@ public class ChecksumUtils {
      * <p>Delta files are replayed in reverse version order, so an identity is marked before its
      * action is applied; the most recent action for a file wins and older duplicates are skipped.
      */
-    private boolean markSeen(UniqueFileActionTuple identity) {
+    private boolean markSeen(FileActionKey identity) {
       if (seenIdentities.contains(identity)) {
         return false;
       }

@@ -18,10 +18,10 @@ package io.delta.kernel.internal.checksum
 import java.lang.{Boolean => JBoolean, Long => JLong}
 import java.util.{Collections, Optional}
 
+import io.delta.kernel.FileActionKey
 import io.delta.kernel.data.Row
 import io.delta.kernel.internal.actions.AddFile
 import io.delta.kernel.internal.replay.LogReplayUtils
-import io.delta.kernel.internal.replay.LogReplayUtils.UniqueFileActionTuple
 import io.delta.kernel.internal.util.VectorUtils.stringStringMapValue
 
 import org.scalatest.funsuite.AnyFunSuite
@@ -52,8 +52,8 @@ class ChecksumStateTrackerSuite extends AnyFunSuite {
   }
 
   /** The (path URI, dvId) identity for a file at the given path. */
-  private def identity(path: String): UniqueFileActionTuple =
-    LogReplayUtils.getUniqueFileAction(addFile(path))
+  private def identity(path: String): FileActionKey =
+    LogReplayUtils.getFileActionKey(addFile(path))
 
   /** A StateTracker collecting allFiles, live-file cap raised so only the seen cap can fire. */
   private def collectingTracker(): ChecksumUtils.StateTracker = {
@@ -62,6 +62,19 @@ class ChecksumStateTrackerSuite extends AnyFunSuite {
     // Raise the live-file map cap so it does not fire first (we want to isolate the seen cap).
     state.allFilesThreshold = Long.MaxValue
     state
+  }
+
+  test("checksum file identity preserves raw URI spelling") {
+    val dotted = identity("a/./b")
+    val plain = identity("a/b")
+    assert(dotted.getPath.toString === "a/./b")
+    assert(plain.getPath.toString === "a/b")
+    assert(dotted !== plain)
+
+    val state = collectingTracker()
+    state.recordAddFile(addFile("a/./b"))
+    state.recordAddFile(addFile("a/b"))
+    assert(state.collectedAllFiles().get().size() === 2)
   }
 
   test("recordAddFile abandons allFiles once the seen set exceeds MAX_SEEN_IDENTITIES") {

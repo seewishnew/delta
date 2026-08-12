@@ -20,6 +20,7 @@ import static io.delta.kernel.internal.TableConfig.TOMBSTONE_RETENTION;
 import static io.delta.kernel.internal.util.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
 
+import io.delta.kernel.IncrementalScanBuilder;
 import io.delta.kernel.Operation;
 import io.delta.kernel.ScanBuilder;
 import io.delta.kernel.Snapshot;
@@ -115,6 +116,30 @@ public class SnapshotImpl implements Snapshot {
       Committer committer,
       SnapshotQueryContext snapshotContext,
       Optional<Long> inCommitTimestampOpt) {
+    this(
+        dataPath,
+        version,
+        lazyLogSegment,
+        logReplay,
+        protocol,
+        metadata,
+        committer,
+        snapshotContext,
+        inCommitTimestampOpt,
+        snapshotContext.isLatestQuery());
+  }
+
+  public SnapshotImpl(
+      Path dataPath,
+      long version,
+      Lazy<LogSegment> lazyLogSegment,
+      LogReplay logReplay,
+      Protocol protocol,
+      Metadata metadata,
+      Committer committer,
+      SnapshotQueryContext snapshotContext,
+      Optional<Long> inCommitTimestampOpt,
+      boolean wasBuiltAsLatest) {
     checkArgument(version >= 0, "A snapshot cannot have version < 0");
     this.logPath = new Path(dataPath, "_delta_log");
     this.dataPath = dataPath;
@@ -125,10 +150,7 @@ public class SnapshotImpl implements Snapshot {
     this.metadata = requireNonNull(metadata);
     this.committer = committer;
     this.inCommitTimestampOpt = inCommitTimestampOpt;
-    // TODO: Post-commit snapshots build a version-based SnapshotQueryContext
-    // (see TransactionImpl.buildPostCommitSnapshotOpt), so isLatestQuery() may be false even
-    // when this snapshot is intended to be the latest version.
-    this.wasBuiltAsLatest = snapshotContext.isLatestQuery();
+    this.wasBuiltAsLatest = wasBuiltAsLatest;
 
     // We create the actual Snapshot report lazily (on first access) instead of eagerly in this
     // constructor because some Snapshot metrics, like {@link
@@ -222,6 +244,11 @@ public class SnapshotImpl implements Snapshot {
   public ScanBuilder getScanBuilder() {
     return new ScanBuilderImpl(
         dataPath, version, protocol, metadata, getSchema(), logReplay, getSnapshotReport());
+  }
+
+  @Override
+  public IncrementalScanBuilder getIncrementalScanBuilder(long baseVersion) {
+    return new IncrementalScanBuilderImpl(this, baseVersion);
   }
 
   @Override
@@ -375,6 +402,28 @@ public class SnapshotImpl implements Snapshot {
     return wasBuiltAsLatest;
   }
 
+  /**
+   * Returns this snapshot with latest-build intent, preserving all retained snapshot state.
+   *
+   * <p>The original snapshot remains immutable. An already-latest snapshot is reused by identity.
+   */
+  public SnapshotImpl promoteToBuiltAsLatest(SnapshotQueryContext snapshotContext) {
+    if (wasBuiltAsLatest) {
+      return this;
+    }
+    return new SnapshotImpl(
+        dataPath,
+        version,
+        lazyLogSegment,
+        logReplay,
+        protocol,
+        metadata,
+        committer,
+        snapshotContext,
+        inCommitTimestampOpt,
+        true /* wasBuiltAsLatest */);
+  }
+
   @Override
   public Protocol getProtocol() {
     return protocol;
@@ -426,6 +475,11 @@ public class SnapshotImpl implements Snapshot {
   @Override
   public Optional<CRCInfo> getCurrentCrcInfo() {
     return logReplay.getCrcInfoAtSnapshotVersion();
+  }
+
+  /** Returns the parsed CRC retained by this snapshot only if it is already in memory. */
+  public Optional<CRCInfo> getLoadedCrcInfo() {
+    return logReplay.getLoadedLastSeenCrcInfo();
   }
 
   @Override

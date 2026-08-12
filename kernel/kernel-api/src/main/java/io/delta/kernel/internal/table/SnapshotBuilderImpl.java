@@ -19,6 +19,7 @@ package io.delta.kernel.internal.table;
 import static io.delta.kernel.internal.util.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
 
+import io.delta.kernel.IncrementalReplay;
 import io.delta.kernel.Snapshot;
 import io.delta.kernel.SnapshotBuilder;
 import io.delta.kernel.commit.Committer;
@@ -27,11 +28,9 @@ import io.delta.kernel.internal.DeltaErrors;
 import io.delta.kernel.internal.SnapshotImpl;
 import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.actions.Protocol;
-import io.delta.kernel.internal.checksum.CRCInfo;
 import io.delta.kernel.internal.files.LogDataUtils;
 import io.delta.kernel.internal.files.ParsedLogData;
 import io.delta.kernel.internal.lang.ListUtils;
-import io.delta.kernel.internal.snapshot.LogSegment;
 import io.delta.kernel.internal.tablefeatures.TableFeatures;
 import io.delta.kernel.internal.util.Tuple2;
 import java.util.Collections;
@@ -47,22 +46,6 @@ import java.util.Optional;
  */
 public class SnapshotBuilderImpl implements SnapshotBuilder {
 
-  /**
-   * Eagerly captured state from a base {@link SnapshotImpl}. No reference to the original snapshot
-   * is retained.
-   */
-  public static class CapturedBaseState {
-    public final LogSegment baseLogSegment;
-    public final Optional<CRCInfo> baseCrcInfo;
-    public final long baseVersion;
-
-    CapturedBaseState(LogSegment baseLogSegment, Optional<CRCInfo> baseCrcInfo, long baseVersion) {
-      this.baseLogSegment = requireNonNull(baseLogSegment);
-      this.baseCrcInfo = requireNonNull(baseCrcInfo);
-      this.baseVersion = baseVersion;
-    }
-  }
-
   public static class Context {
     public final String unresolvedPath;
     public Optional<Long> versionOpt = Optional.empty();
@@ -70,8 +53,9 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
     public Optional<Committer> committerOpt = Optional.empty();
     public List<ParsedLogData> logDatas = Collections.emptyList();
     public Optional<Tuple2<Protocol, Metadata>> protocolAndMetadataOpt = Optional.empty();
+    public IncrementalReplay incrementalReplay = IncrementalReplay.disabled();
     public Optional<Long> maxCatalogVersion = Optional.empty();
-    public Optional<CapturedBaseState> baseStateOpt = Optional.empty();
+    public Optional<SnapshotImpl> baseSnapshotOpt = Optional.empty();
     public List<ParsedLogData> preloadedLogSegment = Collections.emptyList();
 
     public Context(String unresolvedPath) {
@@ -128,24 +112,23 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
   }
 
   @Override
+  public SnapshotBuilderImpl withIncrementalCrcReplay(IncrementalReplay incrementalReplay) {
+    ctx.incrementalReplay = requireNonNull(incrementalReplay, "incrementalReplay is null");
+    return this;
+  }
+
+  @Override
   public SnapshotBuilderImpl withMaxCatalogVersion(long version) {
     checkArgument(version >= 0, "A valid version must be >= 0");
     ctx.maxCatalogVersion = Optional.of(version);
     return this;
   }
 
-  /**
-   * Seeds this builder from an existing snapshot for incremental log replay. Eagerly captures
-   * LogSegment, CRC, and version from the snapshot; the original snapshot reference is not
-   * retained.
-   */
+  /** Seeds this builder from an existing snapshot for retained-state incremental replay. */
   public SnapshotBuilderImpl fromSnapshot(Snapshot snapshot) {
     checkArgument(snapshot instanceof SnapshotImpl, "snapshot must be a SnapshotImpl");
-    SnapshotImpl impl = (SnapshotImpl) snapshot;
-    ctx.baseStateOpt =
-        Optional.of(
-            new CapturedBaseState(
-                impl.getLogSegment(), impl.getCurrentCrcInfo(), impl.getVersion()));
+    final SnapshotImpl baseSnapshot = (SnapshotImpl) snapshot;
+    ctx.baseSnapshotOpt = Optional.of(baseSnapshot);
     return this;
   }
 
@@ -217,9 +200,14 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
   }
 
   private void validateBaseSnapshotVersionConstraint() {
-    if (ctx.baseStateOpt.isPresent() && ctx.versionOpt.isPresent()) {
-      long baseVersion = ctx.baseStateOpt.get().baseVersion;
-      long requestedVersion = ctx.versionOpt.get();
+    if (ctx.baseSnapshotOpt.isPresent()) {
+      Optional<Long> effectiveTarget =
+          ctx.versionOpt.isPresent() ? ctx.versionOpt : ctx.maxCatalogVersion;
+      if (!effectiveTarget.isPresent()) {
+        return;
+      }
+      long baseVersion = ctx.baseSnapshotOpt.get().getVersion();
+      long requestedVersion = effectiveTarget.get();
       checkArgument(
           requestedVersion >= baseVersion,
           String.format(

@@ -79,6 +79,26 @@ public class LogSegment {
 
   private static final Logger logger = LoggerFactory.getLogger(LogSegment.class);
 
+  /** Non-standalone view of the action files that can affect versions above a boundary. */
+  public static final class Tail {
+    private final long endVersion;
+    private final List<FileStatus> filesReversed;
+
+    private Tail(long endVersion, List<FileStatus> filesReversed) {
+      this.endVersion = endVersion;
+      this.filesReversed =
+          Collections.unmodifiableList(new ArrayList<>(requireNonNull(filesReversed)));
+    }
+
+    public long getEndVersion() {
+      return endVersion;
+    }
+
+    public List<FileStatus> getFilesReversed() {
+      return filesReversed;
+    }
+  }
+
   //////////////////////////////////
   // Member methods and variables //
   //////////////////////////////////
@@ -192,9 +212,9 @@ public class LogSegment {
 
     this.logPath = logPath;
     this.version = version;
-    this.deltas = deltas;
-    this.compactions = compactions;
-    this.checkpoints = checkpoints;
+    this.deltas = Collections.unmodifiableList(new ArrayList<>(deltas));
+    this.compactions = Collections.unmodifiableList(new ArrayList<>(compactions));
+    this.checkpoints = Collections.unmodifiableList(new ArrayList<>(checkpoints));
     this.deltaAtEndVersion = deltaAtEndVersion;
     this.lastSeenChecksum = lastSeenChecksum;
     this.maxPublishedDeltaVersion = maxPublishedDeltaVersion;
@@ -321,6 +341,112 @@ public class LogSegment {
   }
 
   /**
+   * Combines this retained segment with a segment assembled from a new overlapping listing.
+   *
+   * <p>The new listing may start immediately after this segment's checkpoint, so files at or below
+   * {@code baseSnapshotVersion} are structural overlap, not a replay tail. A checkpoint discovered
+   * by the new listing replaces the retained checkpoint and trims files it covers.
+   */
+  public LogSegment combineForIncrementalUpdate(
+      LogSegment newlyListedSegment, long baseSnapshotVersion) {
+    requireNonNull(newlyListedSegment, "newlyListedSegment is null");
+    checkArgument(
+        logPath.equals(newlyListedSegment.logPath),
+        "Cannot combine LogSegments for different log paths: %s and %s",
+        logPath,
+        newlyListedSegment.logPath);
+    checkArgument(
+        baseSnapshotVersion == version,
+        "Base snapshot version %d must equal retained LogSegment version %d",
+        baseSnapshotVersion,
+        version);
+    checkArgument(
+        newlyListedSegment.version >= baseSnapshotVersion,
+        "New LogSegment version %d is older than base snapshot version %d",
+        newlyListedSegment.version,
+        baseSnapshotVersion);
+
+    final Optional<Long> newCheckpointVersion = newlyListedSegment.checkpointVersionOpt;
+    final List<FileStatus> combinedDeltas =
+        filesAfterCheckpoint(
+            deltas, newCheckpointVersion, file -> FileNames.deltaVersion(file.getPath()));
+    combinedDeltas.addAll(
+        newlyListedSegment.deltas.stream()
+            .filter(file -> FileNames.deltaVersion(file.getPath()) > baseSnapshotVersion)
+            .collect(Collectors.toList()));
+
+    final List<FileStatus> combinedCompactions =
+        filesAfterCheckpoint(
+            compactions,
+            newCheckpointVersion,
+            file -> FileNames.logCompactionVersions(file.getPath())._1);
+    // A newly discovered compaction spanning the retained/new boundary is ambiguous; keep the raw
+    // commits instead so incremental replay cannot skip or duplicate boundary actions.
+    combinedCompactions.addAll(
+        newlyListedSegment.compactions.stream()
+            .filter(
+                file -> FileNames.logCompactionVersions(file.getPath())._1 > baseSnapshotVersion)
+            .collect(Collectors.toList()));
+
+    final List<FileStatus> combinedCheckpoints =
+        newCheckpointVersion.isPresent() ? newlyListedSegment.checkpoints : checkpoints;
+    final Optional<Long> selectedCheckpointVersion =
+        newCheckpointVersion.isPresent() ? newCheckpointVersion : checkpointVersionOpt;
+    final Optional<FileStatus> combinedChecksum =
+        newlyListedSegment.lastSeenChecksum.isPresent()
+            ? newlyListedSegment.lastSeenChecksum
+            : lastSeenChecksum.filter(
+                file ->
+                    selectedCheckpointVersion
+                        .map(
+                            checkpointVersion ->
+                                FileNames.checksumVersion(file.getPath()) >= checkpointVersion)
+                        .orElse(true));
+    final Optional<Long> combinedMaxPublishedVersion =
+        maxOptional(maxPublishedDeltaVersion, newlyListedSegment.maxPublishedDeltaVersion);
+    final FileStatus endDelta =
+        newlyListedSegment.version == baseSnapshotVersion
+            ? deltaAtEndVersion
+            : newlyListedSegment.deltaAtEndVersion;
+
+    return new LogSegment(
+        logPath,
+        newlyListedSegment.version,
+        combinedDeltas,
+        combinedCompactions,
+        combinedCheckpoints,
+        endDelta,
+        combinedChecksum,
+        combinedMaxPublishedVersion);
+  }
+
+  /**
+   * Returns a non-standalone view containing only commit or compaction files that can affect
+   * versions in {@code (exclusiveVersion, version]}.
+   */
+  public Tail segmentAfterVersion(long exclusiveVersion) {
+    checkArgument(
+        exclusiveVersion <= version,
+        "Tail boundary %d must not exceed LogSegment version %d",
+        exclusiveVersion,
+        version);
+    final List<FileStatus> files =
+        allFilesWithCompactionsReversed().stream()
+            .filter(
+                file -> {
+                  if (FileNames.isCommitFile(file.getPath())) {
+                    return FileNames.deltaVersion(file.getPath()) > exclusiveVersion;
+                  }
+                  if (FileNames.isLogCompactionFile(file.getPath())) {
+                    return FileNames.logCompactionVersions(file.getPath())._1 > exclusiveVersion;
+                  }
+                  return false;
+                })
+            .collect(Collectors.toList());
+    return new Tail(version, files);
+  }
+
+  /**
    * Creates a new LogSegment by extending this LogSegment with additional deltas. Used to construct
    * a post-commit Snapshot from a previous Snapshot.
    *
@@ -430,6 +556,30 @@ public class LogSegment {
     checkArgument(
         deltas.stream().allMatch(fs -> FileNames.isCommitFile(fs.getPath())),
         () -> "deltas must all be actual delta (commit) files: " + deltas);
+  }
+
+  private static List<FileStatus> filesAfterCheckpoint(
+      List<FileStatus> files,
+      Optional<Long> checkpointVersionOpt,
+      java.util.function.ToLongFunction<FileStatus> versionExtractor) {
+    return files.stream()
+        .filter(
+            file ->
+                checkpointVersionOpt
+                    .map(
+                        checkpointVersion -> versionExtractor.applyAsLong(file) > checkpointVersion)
+                    .orElse(true))
+        .collect(Collectors.toCollection(ArrayList::new));
+  }
+
+  private static Optional<Long> maxOptional(Optional<Long> left, Optional<Long> right) {
+    if (!left.isPresent()) {
+      return right;
+    }
+    if (!right.isPresent()) {
+      return left;
+    }
+    return Optional.of(Math.max(left.get(), right.get()));
   }
 
   private void validateCompactionsAreCompactions(List<FileStatus> compactions) {

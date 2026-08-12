@@ -255,6 +255,11 @@ public interface Snapshot {
   ScanBuilder getScanBuilder();
 
   /**
+   * Returns a builder that streams the file-action diff over {@code (baseVersion, getVersion()]}.
+   */
+  IncrementalScanBuilder getIncrementalScanBuilder(long baseVersion);
+
+  /**
    * @return a {@link UpdateTableTransactionBuilder} to build an update table transaction
    * @since 3.4.0
    */

@@ -21,6 +21,7 @@ import static io.delta.kernel.internal.actions.SingleAction.CHECKPOINT_SCHEMA;
 import static io.delta.kernel.internal.replay.LogReplayUtils.*;
 import static io.delta.kernel.internal.util.Preconditions.checkState;
 
+import io.delta.kernel.FileActionKey;
 import io.delta.kernel.data.*;
 import io.delta.kernel.engine.Engine;
 import io.delta.kernel.internal.actions.SetTransaction;
@@ -101,8 +102,8 @@ public class CreateCheckpointIterator implements CloseableIterator<FilteredColum
   private boolean[] selectionVectorBuffer;
 
   // Current state of the tombstones and add files from delta files
-  private final Set<UniqueFileActionTuple> tombstonesFromJson = new HashSet<>();
-  private final Set<UniqueFileActionTuple> addFilesFromJson = new HashSet<>();
+  private final Set<FileActionKey> tombstonesFromJson = new HashSet<>();
+  private final Set<FileActionKey> addFilesFromJson = new HashSet<>();
 
   // Current state of the protocol and metadata. Captures whether protocol or metadata is seen.
   // We traverse the log in reverse, so the first encounter of protocol or metadata is considered
@@ -263,8 +264,7 @@ public class CreateCheckpointIterator implements CloseableIterator<FilteredColum
         continue; // selectionVector will be `false` at rowId by default
       }
 
-      final UniqueFileActionTuple key =
-          getUniqueFileAction(removePathVector, removeDvVector, rowId);
+      final FileActionKey key = getFileActionKey(removePathVector, removeDvVector, rowId);
       tombstonesFromJson.add(key);
 
       // Default is zero. Not sure if this the correct way, but it is same Delta Spark.
@@ -293,7 +293,7 @@ public class CreateCheckpointIterator implements CloseableIterator<FilteredColum
         continue; // selectionVector will be `false` at rowId by default
       }
 
-      final UniqueFileActionTuple key = getUniqueFileAction(addPathVector, addDvVector, rowId);
+      final FileActionKey key = getFileActionKey(addPathVector, addDvVector, rowId);
       final boolean alreadyDeleted = tombstonesFromJson.contains(key);
       final boolean alreadyReturned = addFilesFromJson.contains(key);
 

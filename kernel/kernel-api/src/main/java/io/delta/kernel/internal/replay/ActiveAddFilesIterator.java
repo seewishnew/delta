@@ -22,9 +22,10 @@ import static io.delta.kernel.internal.replay.LogReplay.ADD_FILE_PATH_ORDINAL;
 import static io.delta.kernel.internal.replay.LogReplay.REMOVE_FILE_DV_ORDINAL;
 import static io.delta.kernel.internal.replay.LogReplay.REMOVE_FILE_ORDINAL;
 import static io.delta.kernel.internal.replay.LogReplay.REMOVE_FILE_PATH_ORDINAL;
-import static io.delta.kernel.internal.replay.LogReplayUtils.pathToUri;
+import static io.delta.kernel.internal.replay.LogReplayUtils.getFileActionKey;
 import static io.delta.kernel.internal.replay.LogReplayUtils.prepareSelectionVectorBuffer;
 
+import io.delta.kernel.FileActionKey;
 import io.delta.kernel.data.ColumnVector;
 import io.delta.kernel.data.ColumnarBatch;
 import io.delta.kernel.data.FilteredColumnarBatch;
@@ -35,12 +36,10 @@ import io.delta.kernel.internal.InternalScanFileUtils;
 import io.delta.kernel.internal.actions.DeletionVectorDescriptor;
 import io.delta.kernel.internal.fs.Path;
 import io.delta.kernel.internal.metrics.ScanMetrics;
-import io.delta.kernel.internal.replay.LogReplayUtils.UniqueFileActionTuple;
 import io.delta.kernel.internal.util.Utils;
 import io.delta.kernel.types.StringType;
 import io.delta.kernel.utils.CloseableIterator;
 import java.io.IOException;
-import java.net.URI;
 import java.util.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,8 +58,8 @@ public class ActiveAddFilesIterator implements CloseableIterator<FilteredColumna
 
   private final CloseableIterator<ActionWrapper> iter;
 
-  private final Set<UniqueFileActionTuple> tombstonesFromJson;
-  private final Set<UniqueFileActionTuple> addFilesFromJson;
+  private final Set<FileActionKey> tombstonesFromJson;
+  private final Set<FileActionKey> addFilesFromJson;
 
   private Optional<FilteredColumnarBatch> next;
   /**
@@ -171,12 +170,11 @@ public class ActiveAddFilesIterator implements CloseableIterator<FilteredColumna
 
         // Note: this row doesn't represent the complete RemoveFile schema. It only contains
         //       the fields we need for this replay.
-        final String path = getRemoveFilePath(removesVector, rowId);
-        final URI pathAsUri = pathToUri(path);
-        final Optional<String> dvId =
-            Optional.ofNullable(getRemoveFileDV(removesVector, rowId))
-                .map(DeletionVectorDescriptor::getUniqueId);
-        final UniqueFileActionTuple key = new UniqueFileActionTuple(pathAsUri, dvId);
+        final FileActionKey key =
+            getFileActionKey(
+                removesVector.getChild(REMOVE_FILE_PATH_ORDINAL),
+                removesVector.getChild(REMOVE_FILE_DV_ORDINAL),
+                rowId);
         tombstonesFromJson.add(key);
         metrics.removeFilesFromDeltaFilesCounter.increment();
       }
@@ -201,12 +199,11 @@ public class ActiveAddFilesIterator implements CloseableIterator<FilteredColumna
         metrics.addFilesFromDeltaFilesCounter.increment();
       }
 
-      final String path = getAddFilePath(addsVector, rowId);
-      final URI pathAsUri = pathToUri(path);
-      final Optional<String> dvId =
-          Optional.ofNullable(getAddFileDV(addsVector, rowId))
-              .map(DeletionVectorDescriptor::getUniqueId);
-      final UniqueFileActionTuple key = new UniqueFileActionTuple(pathAsUri, dvId);
+      final FileActionKey key =
+          getFileActionKey(
+              addsVector.getChild(ADD_FILE_PATH_ORDINAL),
+              addsVector.getChild(ADD_FILE_DV_ORDINAL),
+              rowId);
       final boolean alreadyDeleted = tombstonesFromJson.contains(key);
       final boolean alreadyReturned = addFilesFromJson.contains(key);
 

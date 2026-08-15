@@ -21,6 +21,7 @@ import io.delta.kernel.commit.Committer;
 import io.delta.kernel.engine.Engine;
 import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.actions.Protocol;
+import io.delta.kernel.internal.checksum.CRCInfo;
 import io.delta.kernel.internal.files.ParsedLogData;
 import java.util.List;
 
@@ -102,6 +103,19 @@ public interface SnapshotBuilder {
    * @return a new builder instance with the provided log data
    */
   SnapshotBuilder withLogData(List<ParsedLogData> logData);
+
+  /**
+   * Provides a complete pre-built log segment that bypasses listing entirely. Used for hint-seeded
+   * builds where file metadata is already known.
+   */
+  SnapshotBuilder withPreloadedLogSegment(List<ParsedLogData> logSegmentData);
+
+  /**
+   * Provides a parsed checksum (CRCInfo) to seed snapshot construction without reading a physical
+   * .crc file. The factory applies existing eligibility checks (version, checkpoint boundary) and
+   * precedence rules (disk .crc wins if newer).
+   */
+  SnapshotBuilder withLoadedCrcInfo(CRCInfo crcInfo);
 
   /**
    * Provides protocol and metadata information to optimize table resolution.

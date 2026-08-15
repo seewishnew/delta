@@ -233,7 +233,7 @@ public class SnapshotFactory {
           selectAndAdvanceCrc(
               engine,
               logSegment,
-              Optional.empty() /* inMemoryBase */,
+              ctx.loadedCrcInfo /* inMemoryBase */,
               snapshotCtx.getSnapshotMetrics());
       targetCrcInfo = lazyCrcInfo.get().filter(crc -> crc.getVersion() == logSegment.getVersion());
     }
@@ -273,7 +273,10 @@ public class SnapshotFactory {
         logReplay,
         protocol,
         metadata,
-        ctx.committerOpt.orElse(DefaultFileSystemManagedTableOnlyCommitter.INSTANCE),
+        ctx.committerOpt.orElse(
+            ctx.baseSnapshotOpt
+                .map(SnapshotImpl::getCommitter)
+                .orElse(DefaultFileSystemManagedTableOnlyCommitter.INSTANCE)),
         snapshotCtx,
         Optional.empty() /* inCommitTimestampOpt */,
         builtAsLatest);

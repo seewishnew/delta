@@ -28,6 +28,7 @@ import io.delta.kernel.internal.DeltaErrors;
 import io.delta.kernel.internal.SnapshotImpl;
 import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.actions.Protocol;
+import io.delta.kernel.internal.checksum.CRCInfo;
 import io.delta.kernel.internal.files.LogDataUtils;
 import io.delta.kernel.internal.files.ParsedLogData;
 import io.delta.kernel.internal.lang.ListUtils;
@@ -57,6 +58,7 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
     public Optional<Long> maxCatalogVersion = Optional.empty();
     public Optional<SnapshotImpl> baseSnapshotOpt = Optional.empty();
     public List<ParsedLogData> preloadedLogSegment = Collections.emptyList();
+    public Optional<CRCInfo> loadedCrcInfo = Optional.empty();
 
     public Context(String unresolvedPath) {
       this.unresolvedPath = requireNonNull(unresolvedPath, "unresolvedPath is null");
@@ -133,8 +135,15 @@ public class SnapshotBuilderImpl implements SnapshotBuilder {
   }
 
   /** Provides a pre-parsed log segment to bypass SnapshotManager listing entirely. */
+  @Override
   public SnapshotBuilderImpl withPreloadedLogSegment(List<ParsedLogData> logSegmentData) {
     ctx.preloadedLogSegment = requireNonNull(logSegmentData);
+    return this;
+  }
+
+  @Override
+  public SnapshotBuilderImpl withLoadedCrcInfo(CRCInfo crcInfo) {
+    ctx.loadedCrcInfo = Optional.of(requireNonNull(crcInfo, "crcInfo is null"));
     return this;
   }
 

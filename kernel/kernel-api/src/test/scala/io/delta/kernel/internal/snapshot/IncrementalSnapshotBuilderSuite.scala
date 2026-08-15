@@ -25,6 +25,7 @@ import scala.collection.mutable
 
 import io.delta.kernel.{FileActionKey, IncrementalReplay, SnapshotBuilder, TableManager}
 import io.delta.kernel.Snapshot.ChecksumWriteMode
+import io.delta.kernel.commit.Committer
 import io.delta.kernel.data.{ColumnarBatch, ColumnVector, MapValue, Row}
 import io.delta.kernel.engine._
 import io.delta.kernel.expressions.{Column, Expression, ExpressionEvaluator, Literal, PartitionValueExpression, Predicate, PredicateEvaluator, ScalarExpression}
@@ -3156,5 +3157,234 @@ class IncrementalSnapshotBuilderSuite extends AnyFunSuite with ActionUtils {
 
     assert(result.getCurrentCrcInfo.get.getVersion == 2)
     assert(counting.trace.crcReads == Seq(targetCrc.getPath))
+  }
+
+  // ------------------------------------------------------------------
+  // Contract tests for withLoadedCrcInfo + withPreloadedLogSegment APIs
+  // ------------------------------------------------------------------
+
+  test("withLoadedCrcInfo at target version supplies CRC " +
+    "without disk read") {
+    val counting = new CountingEngine
+    val commit0 = counting.putCommit(0, initialActions("v0"))
+    counting.putCheckpoint(
+      0,
+      checkpointActions("v0", Seq.empty))
+    val commit1 = counting.putCommit(
+      1,
+      writeCommit(addAction("v1.parquet")))
+    val commit2 = counting.putCommit(
+      2,
+      writeCommit(addAction("v2.parquet")))
+
+    // Construct CRC at version 2 programmatically
+    val refCrc = crcAt(
+      2,
+      "v0",
+      tableSizeBytes = 30,
+      numFiles = 3)
+
+    // Build using preloaded segment + injected CRC
+    val preloaded = Seq(commit0, commit1, commit2)
+      .map(ParsedLogData.forFileStatus)
+    counting.clearIo()
+
+    val result = TableManager
+      .loadSnapshot(tablePath.toString)
+      .atVersion(2)
+      .withPreloadedLogSegment(preloaded.asJava)
+      .withLoadedCrcInfo(refCrc)
+      .build(counting.engine)
+      .asInstanceOf[SnapshotImpl]
+    val trace = counting.trace
+
+    assert(result.getCurrentCrcInfo.isPresent)
+    assert(result.getCurrentCrcInfo.get == refCrc)
+    assert(
+      trace.crcReads.isEmpty,
+      "no .crc file should be read when CRC is injected")
+    assert(trace.listStarts.isEmpty, "preloaded segment bypasses listing")
+  }
+
+  test("stale withLoadedCrcInfo is dropped when version" +
+    " is before checkpoint") {
+    val counting = new CountingEngine
+    counting.putCommit(0, initialActions("v0"))
+    counting.putCommit(
+      1,
+      writeCommit(addAction("v1.parquet")))
+    counting.putCommit(
+      2,
+      writeCommit(addAction("v2.parquet")))
+    val checkpoint3 = counting.putCheckpoint(
+      3,
+      checkpointActions("v3", Seq(1L, 2L)))
+    counting.putCommit(
+      3,
+      writeCommit(
+        metadataAction(metadata("v3")),
+        addAction("v3.parquet")))
+    val commit4 = counting.putCommit(
+      4,
+      writeCommit(addAction("v4.parquet")))
+    val commit5 = counting.putCommit(
+      5,
+      writeCommit(addAction("v5.parquet")))
+
+    // CRC at version 2 is before checkpoint at 3
+    val staleCrc = crcAt(
+      2,
+      "v0",
+      tableSizeBytes = 20,
+      numFiles = 2)
+
+    val preloaded = Seq(
+      checkpoint3,
+      commit4,
+      commit5).map(ParsedLogData.forFileStatus)
+    counting.clearIo()
+
+    val result = TableManager
+      .loadSnapshot(tablePath.toString)
+      .atVersion(5)
+      .withPreloadedLogSegment(preloaded.asJava)
+      .withLoadedCrcInfo(staleCrc)
+      .build(counting.engine)
+      .asInstanceOf[SnapshotImpl]
+
+    // getEligibleCrc filters: crc.version (2) <
+    // checkpointVersion (3) -> ineligible
+    assert(
+      !result.getCurrentCrcInfo.isPresent ||
+        result.getCurrentCrcInfo.get.getVersion != 2,
+      "stale CRC at version 2 (before checkpoint@3) " +
+        "must not appear on the snapshot")
+  }
+
+  test("disk .crc in preloaded segment wins over " +
+    "injected when newer") {
+    val counting = new CountingEngine
+    val commit0 = counting.putCommit(0, initialActions("v0"))
+    val commit1 = counting.putCommit(
+      1,
+      writeCommit(addAction("v1.parquet")))
+    val commit2 = counting.putCommit(
+      2,
+      writeCommit(addAction("v2.parquet")))
+    val commit3 = counting.putCommit(
+      3,
+      writeCommit(addAction("v3.parquet")))
+
+    // Disk CRC at the target version (3)
+    val diskCrc3 = counting.putCrc(
+      3,
+      crcAt(3, "v0", tableSizeBytes = 40, numFiles = 4))
+    // Injected CRC at an older version (1)
+    val injectedCrc = crcAt(
+      1,
+      "v0",
+      tableSizeBytes = 10,
+      numFiles = 1)
+
+    val preloaded =
+      Seq(commit0, commit1, commit2, commit3, diskCrc3).map(ParsedLogData.forFileStatus)
+    counting.clearIo()
+
+    val result = TableManager
+      .loadSnapshot(tablePath.toString)
+      .atVersion(3)
+      .withPreloadedLogSegment(preloaded.asJava)
+      .withLoadedCrcInfo(injectedCrc)
+      .build(counting.engine)
+      .asInstanceOf[SnapshotImpl]
+    val crc = result.getCurrentCrcInfo
+
+    assert(crc.isPresent, "CRC must be present")
+    assert(crc.get.getVersion == 3, "disk CRC at target version wins")
+    assert(crc.get.getTableSizeBytes == 40)
+    assert(crc.get.getNumFiles == 4)
+    assert(
+      counting.trace.crcReads.contains(diskCrc3.getPath),
+      "disk .crc file must be read")
+  }
+
+  test("builderFrom(base).withPreloadedLogSegment " +
+    "preserves base committer") {
+    val counting = new CountingEngine
+    val commit0 = counting.putCommit(0, initialActions("v0"))
+
+    val customCommitter = new Committer {
+      override def commit(
+          engine: Engine,
+          actions: CloseableIterator[Row],
+          metadata: io.delta.kernel.commit.CommitMetadata): io.delta.kernel.commit.CommitResponse =
+        throw new UnsupportedOperationException
+    }
+
+    val base = coldSnapshot(counting, 0, configure = _.withCommitter(customCommitter))
+    assert(base.getCommitter eq customCommitter)
+
+    val commit1 = counting.putCommit(
+      1,
+      writeCommit(addAction("v1.parquet")))
+    val preloaded = Seq(commit0, commit1)
+      .map(ParsedLogData.forFileStatus)
+    counting.clearIo()
+
+    val result = TableManager
+      .builderFrom(tablePath.toString, base)
+      .atVersion(1)
+      .withPreloadedLogSegment(preloaded.asJava)
+      .build(counting.engine)
+      .asInstanceOf[SnapshotImpl]
+
+    assert(result.getCommitter eq customCommitter, "committer from base snapshot must be preserved")
+    assert(result.getVersion == 1)
+  }
+
+  test("withLoadedCrcInfo provides P&M without " +
+    "ProtocolMetadataLogReplay") {
+    val counting = new CountingEngine
+    val commit0 = counting.putCommit(0, initialActions("v0"))
+    val commit1 = counting.putCommit(
+      1,
+      writeCommit(addAction("v1.parquet")))
+    val commit2 = counting.putCommit(
+      2,
+      writeCommit(addAction("v2.parquet")))
+
+    // CRC at the target version carries P&M
+    val crcMetadata = metadata("from-crc")
+    val targetCrc = new CRCInfo(
+      2,
+      crcMetadata,
+      protocol,
+      20,
+      2,
+      Optional.empty(),
+      Optional.empty(),
+      Optional.empty())
+
+    val preloaded = Seq(commit0, commit1, commit2)
+      .map(ParsedLogData.forFileStatus)
+    counting.clearIo()
+
+    val result = TableManager
+      .loadSnapshot(tablePath.toString)
+      .atVersion(2)
+      .withPreloadedLogSegment(preloaded.asJava)
+      .withLoadedCrcInfo(targetCrc)
+      .build(counting.engine)
+      .asInstanceOf[SnapshotImpl]
+    val crc = result.getCurrentCrcInfo
+
+    assert(crc.isPresent)
+    assert(crc.get.getVersion == 2)
+    assert(crc.get.getProtocol == protocol)
+    assert(crc.get.getMetadata == crcMetadata)
+    assert(
+      result.getTableProperties.get("fixture.state") ==
+        "from-crc",
+      "P&M from the target-version CRC should be used")
   }
 }

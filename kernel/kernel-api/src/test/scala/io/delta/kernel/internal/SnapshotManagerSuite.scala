@@ -15,6 +15,7 @@
  */
 package io.delta.kernel.internal
 
+import java.io.FileNotFoundException
 import java.lang.{Long => JLong}
 import java.util.{Arrays, Collections, Optional}
 
@@ -26,9 +27,11 @@ import io.delta.kernel.engine.FileReadResult
 import io.delta.kernel.exceptions.{InvalidTableException, TableNotFoundException}
 import io.delta.kernel.expressions.Predicate
 import io.delta.kernel.internal.checkpoints.{CheckpointInstance, CheckpointMetaData, SidecarFile}
+import io.delta.kernel.internal.files.ParsedLogData
 import io.delta.kernel.internal.fs.Path
 import io.delta.kernel.internal.snapshot.{LogSegment, SnapshotManager}
 import io.delta.kernel.internal.util.{FileNames, Utils}
+import io.delta.kernel.test.BaseMockFileSystemClient
 import io.delta.kernel.test.BaseMockJsonHandler
 import io.delta.kernel.test.BaseMockParquetHandler
 import io.delta.kernel.test.MockFileSystemClientUtils
@@ -69,7 +72,30 @@ class SnapshotManagerSuite extends AnyFunSuite with MockFileSystemClientUtils {
 
   private val snapshotManager = new SnapshotManager(dataPath)
 
+  private class RecordingFileSystemClient(statuses: Map[String, FileStatus])
+      extends BaseMockFileSystemClient {
+    private var fileStatusCalls: Seq[String] = Seq.empty
+
+    override def getFileStatus(path: String): FileStatus = {
+      fileStatusCalls = fileStatusCalls :+ path
+      statuses.getOrElse(path, throw new FileNotFoundException(path))
+    }
+
+    def getFileStatusCalls: Seq[String] = fileStatusCalls
+  }
+
   /* ------------------HELPER METHODS------------------ */
+
+  private def assembleLogSegment(
+      sourcedFiles: Seq[FileStatus],
+      fileSystemClient: RecordingFileSystemClient,
+      versionToLoad: Optional[JLong] = Optional.empty()): LogSegment = {
+    snapshotManager.assembleLogSegment(
+      mockEngine(fileSystemClient = fileSystemClient),
+      sourcedFiles.map(ParsedLogData.forFileStatus).asJava,
+      Collections.emptyList[ParsedLogData](),
+      versionToLoad)
+  }
 
   private def checkLogSegment(
       logSegment: LogSegment,
@@ -281,14 +307,103 @@ class SnapshotManagerSuite extends AnyFunSuite with MockFileSystemClientUtils {
       versionToLoad: Optional[java.lang.Long] = Optional.empty(),
       expectedErrorMessageContains: String = "")(implicit classTag: ClassTag[T]): Unit = {
     val e = intercept[T] {
+      val fileSystemClient = new MockListFromFileSystemClient(listFromProvider(files)) {
+        override def getFileStatus(path: String): FileStatus =
+          throw new FileNotFoundException(path)
+      }
       snapshotManager.getLogSegmentForVersion(
-        createMockFSAndJsonEngineForLastCheckpoint(files, lastCheckpointVersion),
+        mockEngine(
+          fileSystemClient = fileSystemClient,
+          jsonHandler = if (lastCheckpointVersion.isPresent) {
+            new MockReadLastCheckpointFileJsonHandler(
+              s"$logPath/_last_checkpoint",
+              lastCheckpointVersion.get())
+          } else {
+            null
+          }),
         versionToLoad)
     }
     assert(e.getMessage.contains(expectedErrorMessageContains))
   }
 
   /* ------------------- VALID DELTA LOG FILE LISTINGS ----------------------- */
+
+  test("assembleLogSegment: supplied checkpoint delta needs no status lookup") {
+    val deltaAtCheckpoint = deltaFileStatuses(Seq(10L)).head
+    val checkpoint = singularCheckpointFileStatuses(Seq(10L)).head
+    val fileSystemClient = new RecordingFileSystemClient(Map.empty)
+
+    val logSegment = assembleLogSegment(Seq(deltaAtCheckpoint, checkpoint), fileSystemClient)
+
+    assert(fileSystemClient.getFileStatusCalls.isEmpty)
+    assert(logSegment.getVersion == 10L)
+    assert(logSegment.getMaxPublishedDeltaVersion == Optional.of(10L))
+  }
+
+  test("assembleLogSegment: resolves missing checkpoint delta exactly once") {
+    val deltaAtCheckpoint = deltaFileStatuses(Seq(10L)).head
+    val checkpoint = singularCheckpointFileStatuses(Seq(10L)).head
+    val fileSystemClient =
+      new RecordingFileSystemClient(Map(deltaAtCheckpoint.getPath -> deltaAtCheckpoint))
+
+    val logSegment = assembleLogSegment(Seq(checkpoint), fileSystemClient)
+
+    assert(fileSystemClient.getFileStatusCalls == Seq(deltaAtCheckpoint.getPath))
+    assert(logSegment.getVersion == 10L)
+    assert(logSegment.getMaxPublishedDeltaVersion == Optional.of(10L))
+  }
+
+  test("assembleLogSegment: missing checkpoint delta fails explicitly") {
+    val checkpoint = singularCheckpointFileStatuses(Seq(10L)).head
+    val fileSystemClient = new RecordingFileSystemClient(Map.empty)
+
+    val error = intercept[InvalidTableException] {
+      assembleLogSegment(Seq(checkpoint), fileSystemClient)
+    }
+
+    assert(fileSystemClient.getFileStatusCalls == Seq(FileNames.deltaFile(logPath, 10L)))
+    assert(error.getMessage.contains("Missing delta file for version 10"))
+  }
+
+  test("assembleLogSegment: shuffled published deltas are rejected") {
+    val shuffledDeltas = deltaFileStatuses(Seq(0L, 2L, 1L))
+
+    val error = intercept[InvalidTableException] {
+      assembleLogSegment(shuffledDeltas, new RecordingFileSystemClient(Map.empty))
+    }
+
+    assert(error.getMessage.contains("versions are not contiguous"))
+  }
+
+  test("assembleLogSegment: selects newest eligible checksum independent of input order") {
+    val deltas = deltaFileStatuses(0L to 2L)
+    val checksumAt1 = FileStatus.of(FileNames.checksumFile(logPath, 1L).toString, 10, 10)
+    val checksumAt2 = FileStatus.of(FileNames.checksumFile(logPath, 2L).toString, 10, 20)
+    val checksumAt3 = FileStatus.of(FileNames.checksumFile(logPath, 3L).toString, 10, 30)
+
+    val logSegment = assembleLogSegment(
+      deltas ++ Seq(checksumAt2, checksumAt3, checksumAt1),
+      new RecordingFileSystemClient(Map.empty),
+      Optional.of(2L))
+
+    assert(logSegment.getLastSeenChecksum == Optional.of(checksumAt2))
+  }
+
+  test("getLogSegmentForVersion: retries stale checkpoint absence but propagates corruption") {
+    val retryableFiles =
+      deltaFileStatuses(0L to 12L) ++ singularCheckpointFileStatuses(Seq(10L))
+    val logSegment = snapshotManager.getLogSegmentForVersion(
+      createMockFSAndJsonEngineForLastCheckpoint(retryableFiles, Optional.of(20L)),
+      Optional.empty())
+
+    assert(logSegment.getVersion == 12L)
+    assert(logSegment.getCheckpointVersionOpt == Optional.of(10L))
+
+    testExpectedError[InvalidTableException](
+      files = singularCheckpointFileStatuses(Seq(10L)),
+      lastCheckpointVersion = Optional.of(10L),
+      expectedErrorMessageContains = "Missing delta file for version 10")
+  }
 
   test("getLogSegmentForVersion: 000.json only") {
     testNoCheckpoint(Seq(0))
@@ -875,29 +990,25 @@ class SnapshotManagerSuite extends AnyFunSuite with MockFileSystemClientUtils {
       expectedErrorMessageContains = "No delta files found in the directory")
   }
 
-  // _last_checkpoint=20, only deltas v20-v24 exist (no checkpoints, no files before v20)
-  // Primary: no checkpoint found -> returns empty. Fallback: lists from v0, finds deltas
-  // starting at v20 -> throws InvalidTableException (gap from v0). Caught and rethrown as
-  // missingCheckpoint for the hinted version.
-  test("getLogSegmentForVersion: stale _last_checkpoint - fallback checkpoint also deleted " +
-    "(truncated log)") {
+  // _last_checkpoint=20, only deltas v20-v24 exist (no checkpoints, no files before v20).
+  // The stale start is recoverable, but the fallback listing's gap is real corruption and must
+  // propagate rather than being rewritten as a stale-checkpoint error.
+  test("getLogSegmentForVersion: stale _last_checkpoint propagates fallback corruption") {
     testExpectedError[InvalidTableException](
       files = deltaFileStatuses(20L until 25L),
       lastCheckpointVersion = Optional.of(20L),
-      expectedErrorMessageContains = "Missing checkpoint at version 20")
+      expectedErrorMessageContains = "Cannot compute snapshot. Missing delta file version 0.")
   }
 
   // _last_checkpoint=30 (beyond all files), fallback finds checkpoint at 10
-  // but deltas after 10 are non-contiguous (11, 13 -- missing 12)
-  // Fallback throws InvalidTableException, caught and rethrown as missingCheckpoint
-  test("getLogSegmentForVersion: stale _last_checkpoint - fallback finds corrupt listing " +
-    "(exercises catch branch)") {
+  // but deltas after 10 are non-contiguous (11, 13 -- missing 12).
+  test("getLogSegmentForVersion: stale _last_checkpoint propagates non-contiguous fallback") {
     val files = deltaFileStatuses(Seq(10L, 11L, 13L)) ++
       singularCheckpointFileStatuses(Seq(10L))
     testExpectedError[InvalidTableException](
       files,
       lastCheckpointVersion = Optional.of(30L),
-      expectedErrorMessageContains = "Missing checkpoint at version 30")
+      expectedErrorMessageContains = "versions are not contiguous")
   }
 
   /* ------------------- CATALOG MANAGED TABLE TESTS ------------------ */

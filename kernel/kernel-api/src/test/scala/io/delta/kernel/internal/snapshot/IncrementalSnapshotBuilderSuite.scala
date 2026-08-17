@@ -94,6 +94,7 @@ class IncrementalSnapshotBuilderSuite extends AnyFunSuite with ActionUtils {
     private val visibleFiles = mutable.ArrayBuffer(initialFiles: _*)
     private val actionRows = mutable.Map(initialRows.toSeq: _*)
     private val crcInfos = mutable.Map(initialCrcs.toSeq: _*)
+    private val statusOnlyFiles = mutable.Map.empty[String, FileStatus]
 
     private val listStarts = mutable.ArrayBuffer.empty[String]
     private val listResults = mutable.ArrayBuffer.empty[Seq[String]]
@@ -144,7 +145,10 @@ class IncrementalSnapshotBuilderSuite extends AnyFunSuite with ActionUtils {
 
       override def getFileStatus(path: String): FileStatus = {
         fileStatusProbes += path
-        visibleFiles.find(_.getPath == path).getOrElse(throw new FileNotFoundException(path))
+        visibleFiles
+          .find(_.getPath == path)
+          .orElse(statusOnlyFiles.get(path))
+          .getOrElse(throw new FileNotFoundException(path))
       }
 
       override def copyFileAtomically(
@@ -336,6 +340,11 @@ class IncrementalSnapshotBuilderSuite extends AnyFunSuite with ActionUtils {
 
     def removeVisible(path: String): Unit = {
       visibleFiles --= visibleFiles.filter(_.getPath == path)
+    }
+
+    def makeStatusOnly(status: FileStatus): Unit = {
+      removeVisible(status.getPath)
+      statusOnlyFiles.put(status.getPath, status)
     }
 
     def clearIo(): Unit = {
@@ -2021,6 +2030,58 @@ class IncrementalSnapshotBuilderSuite extends AnyFunSuite with ActionUtils {
     assert(refreshTrace.crcReads.isEmpty)
   }
 
+  test("a newer checkpoint supersedes truncated history before the base") {
+    val counting = new CountingEngine
+    counting.putCommit(0, initialActions("v0"))
+    counting.putCheckpoint(0, checkpointActions("v0", Seq.empty))
+    val commit1 = counting.putCommit(1, Seq(addAction("v1.parquet")))
+    val base = coldSnapshot(counting, 1)
+
+    counting.removeVisible(commit1.getPath)
+    val commit3 = counting.putCommit(3, Seq(addAction("v3.parquet")))
+    val checkpoint3 =
+      counting.putCheckpoint(3, checkpointActions("v3", Seq(1L, 3L)))
+    counting.clearIo()
+
+    val result = from(counting, base, version = Some(3))
+    val trace = counting.trace
+
+    assert(result.getVersion == 3)
+    assert(result.getTableProperties.get("fixture.state") == "v3")
+    assert(result.getLogSegment.getCheckpointVersionOpt == Optional.of(3L))
+    assertSingleListFrom(trace, 1)
+    assert(trace.fileStatusProbes.isEmpty)
+    assert(trace.checkpointReads == Seq(checkpoint3.getPath))
+    assert(!trace.commitJsonReads.exists(path => FileNames.deltaVersion(path) == 2))
+    assert(trace.listResults.flatten.contains(commit3.getPath))
+  }
+
+  test("new checkpoint resolves its unlisted commit status exactly once") {
+    val counting = new CountingEngine
+    counting.putCommit(0, initialActions("v0"))
+    counting.putCheckpoint(0, checkpointActions("v0", Seq.empty))
+    counting.putCommit(1, Seq(addAction("v1.parquet")))
+    val base = coldSnapshot(counting, 1)
+
+    counting.putCommit(
+      2,
+      Seq(metadataAction(metadata("v2")), addAction("v2.parquet")))
+    val commit3 = counting.putCommit(3, Seq(addAction("v3.parquet")))
+    counting.makeStatusOnly(commit3)
+    val checkpoint3 = counting.putCheckpoint(3, checkpointActions("v2", 1L to 3L))
+    counting.putCommit(4, Seq(addAction("v4.parquet")))
+    counting.clearIo()
+
+    val result = from(counting, base, version = Some(4))
+    val trace = counting.trace
+
+    assert(result.getVersion == 4)
+    assert(result.getTableProperties.get("fixture.state") == "v2")
+    assert(result.getLogSegment.getCheckpointVersionOpt == Optional.of(3L))
+    assert(trace.fileStatusProbes == Seq(commit3.getPath))
+    assert(trace.checkpointReads == Seq(checkpoint3.getPath))
+  }
+
   test("Rust case D.2: checkpoint behind the base advances lineage without regressing P&M") {
     val counting = new CountingEngine
     counting.putCommit(0, initialActions("v0"))
@@ -2517,6 +2578,105 @@ class IncrementalSnapshotBuilderSuite extends AnyFunSuite with ActionUtils {
     assert(result.getLogSegment.getMaxPublishedDeltaVersion == Optional.of(1L))
     assert(refreshTrace.commitJsonReads == Seq(stagedV2.getPath))
     assertSingleListFrom(refreshTrace, 1)
+  }
+
+  test("checkpoint-only preloaded build resolves the checkpoint commit once") {
+    val counting = new CountingEngine
+    val commit0 = counting.putCommit(0, initialActions("v0"))
+    val checkpoint0 = counting.putCheckpoint(0, checkpointActions("v0", Seq.empty))
+    counting.clearIo()
+
+    val result = TableManager
+      .loadSnapshot(tablePath.toString)
+      .atVersion(0)
+      .withPreloadedLogSegment(Seq(checkpoint0).map(ParsedLogData.forFileStatus).asJava)
+      .build(counting.engine)
+      .asInstanceOf[SnapshotImpl]
+    val trace = counting.trace
+
+    assert(result.getVersion == 0)
+    assert(result.getLogSegment.getCheckpointVersionOpt == Optional.of(0L))
+    assert(result.getLogSegment.getDeltaFileAtEndVersion == commit0)
+    assert(trace.listStarts.isEmpty)
+    assert(trace.fileStatusProbes == Seq(commit0.getPath))
+  }
+
+  test("preloaded checkpoint with its commit performs no status lookup") {
+    val counting = new CountingEngine
+    val commit0 = counting.putCommit(0, initialActions("v0"))
+    val checkpoint0 = counting.putCheckpoint(0, checkpointActions("v0", Seq.empty))
+    val preloaded = Seq(commit0, checkpoint0).map(ParsedLogData.forFileStatus)
+    counting.clearIo()
+
+    val result = TableManager
+      .loadSnapshot(tablePath.toString)
+      .atVersion(0)
+      .withPreloadedLogSegment(preloaded.asJava)
+      .build(counting.engine)
+      .asInstanceOf[SnapshotImpl]
+
+    assert(result.getLogSegment.getCheckpointVersionOpt == Optional.of(0L))
+    assert(counting.trace.listStarts.isEmpty)
+    assert(counting.trace.fileStatusProbes.isEmpty)
+  }
+
+  test("preloaded build honors a timestamp-resolved target version") {
+    val counting = new CountingEngine
+    val commit0 = counting.putCommit(0, initialActions("v0"))
+    val commit1 = counting.putCommit(
+      1,
+      Seq(metadataAction(metadata("v1")), addAction("v1.parquet")))
+    val latestSnapshot = coldSnapshot(counting, 1)
+    val preloaded = Seq(commit0, commit1).map(ParsedLogData.forFileStatus)
+    counting.clearIo()
+
+    val result = TableManager
+      .loadSnapshot(tablePath.toString)
+      .atTimestamp(0L, latestSnapshot)
+      .withPreloadedLogSegment(preloaded.asJava)
+      .build(counting.engine)
+      .asInstanceOf[SnapshotImpl]
+
+    assert(result.getVersion == 0)
+    assert(result.getLogSegment.getVersion == 0)
+    assert(result.getTableProperties.get("fixture.state") == "v0")
+  }
+
+  test("preloaded boundary rejects catalog data beyond its authoritative source") {
+    val counting = new CountingEngine
+    val commit0 = counting.putCommit(
+      0,
+      Seq(
+        protocolAction(protocolWithCatalogManagedSupport),
+        metadataAction(metadata("v0")),
+        addAction("base.parquet")))
+    val base = coldSnapshot(counting, 0, configure = _.withMaxCatalogVersion(0))
+    val preloadedV1 = counting.putCommit(1, Seq(addAction("preloaded-v1.parquet")))
+    val catalogV2 = counting.putStagedCommit(2, Seq(addAction("catalog-v2.parquet")))
+    val catalogData: Seq[ParsedLogData] =
+      Seq(ParsedCatalogCommitData.forFileStatus(catalogV2))
+    val preloaded = Seq(commit0, preloadedV1).map(ParsedLogData.forFileStatus)
+    counting.clearIo()
+
+    val builder = TableManager
+      .builderFrom(tablePath.toString, base)
+      .withLogData(catalogData.asJava)
+      .withMaxCatalogVersion(2)
+      .asInstanceOf[SnapshotBuilderImpl]
+      .withPreloadedLogSegment(preloaded.asJava)
+    val error = intercept[RuntimeException] {
+      builder.build(counting.engine)
+    }
+    val trace = counting.trace
+
+    assert(
+      error.getMessage.contains("2") &&
+        error.getMessage.contains("1") &&
+        error.getMessage.toLowerCase.contains("available"),
+      s"diagnostic must identify target 2 and preloaded boundary 1: ${error.getMessage}")
+    assert(trace.listStarts.isEmpty)
+    assert(trace.fileStatusProbes.isEmpty)
+    assert(trace.contentReads.isEmpty)
   }
 
   test("distinct preloaded-source path wins over available storage and catalog conflicts") {

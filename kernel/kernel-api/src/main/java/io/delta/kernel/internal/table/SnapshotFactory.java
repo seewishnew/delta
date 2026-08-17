@@ -31,14 +31,9 @@ import io.delta.kernel.internal.checksum.ChecksumReader;
 import io.delta.kernel.internal.checksum.ChecksumUtils;
 import io.delta.kernel.internal.commit.DefaultFileSystemManagedTableOnlyCommitter;
 import io.delta.kernel.internal.files.ParsedCatalogCommitData;
-import io.delta.kernel.internal.files.ParsedCheckpointData;
-import io.delta.kernel.internal.files.ParsedChecksumData;
-import io.delta.kernel.internal.files.ParsedLogCompactionData;
 import io.delta.kernel.internal.files.ParsedLogData;
-import io.delta.kernel.internal.files.ParsedPublishedDeltaData;
 import io.delta.kernel.internal.fs.Path;
 import io.delta.kernel.internal.lang.Lazy;
-import io.delta.kernel.internal.lang.ListUtils;
 import io.delta.kernel.internal.metrics.SnapshotMetrics;
 import io.delta.kernel.internal.metrics.SnapshotQueryContext;
 import io.delta.kernel.internal.metrics.SnapshotReportImpl;
@@ -52,10 +47,7 @@ import io.delta.kernel.internal.util.Tuple2;
 import io.delta.kernel.utils.FileStatus;
 import java.io.IOException;
 import java.util.Collections;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
@@ -514,24 +506,16 @@ public class SnapshotFactory {
   private Lazy<LogSegment> getLazyLogSegment(
       Engine engine, SnapshotQueryContext snapshotCtx, Optional<Long> timeTravelVersion) {
 
-    // Path A: preloaded log segment bypasses
-    // SnapshotManager entirely
+    // Path A: preloaded log segment uses shared assembly without listing.
     if (!ctx.preloadedLogSegment.isEmpty()) {
       return new Lazy<>(
           () -> {
-            final Path logPath = new Path(tablePath, "_delta_log");
+            final Optional<Long> effectiveTarget =
+                timeTravelVersion.isPresent() ? timeTravelVersion : ctx.maxCatalogVersion;
             final LogSegment segment =
-                buildLogSegmentFromPreloadedData(logPath, ctx.preloadedLogSegment);
-            // Fix 3: validate preloaded segment version
-            // matches requested version if set
-            if (ctx.versionOpt.isPresent()) {
-              long segVer = segment.getVersion();
-              checkArgument(
-                  segVer == ctx.versionOpt.get(),
-                  "Preloaded segment version %s does " + "not match requested version %s",
-                  segVer,
-                  ctx.versionOpt.get());
-            }
+                new SnapshotManager(tablePath)
+                    .assembleLogSegment(
+                        engine, ctx.preloadedLogSegment, Collections.emptyList(), effectiveTarget);
             snapshotCtx.setResolvedVersion(segment.getVersion());
             snapshotCtx.setCheckpointVersion(segment.getCheckpointVersionOpt());
             return segment;
@@ -583,92 +567,5 @@ public class SnapshotFactory {
           !ctx.maxCatalogVersion.isPresent(),
           "Should not provide maxCatalogVersion for " + "file-system managed tables");
     }
-  }
-
-  /**
-   * Builds a {@link LogSegment} from pre-parsed log data, bypassing SnapshotManager's file listing
-   * entirely. Partitions the data by type, validates contiguity, and constructs the segment.
-   */
-  private static LogSegment buildLogSegmentFromPreloadedData(
-      Path logPath, List<ParsedLogData> data) {
-    checkArgument(!data.isEmpty(), "preloadedLogSegment must not be empty");
-
-    // Partition by category class
-    final Map<Class<? extends ParsedLogData>, List<ParsedLogData>> partitioned =
-        data.stream()
-            .collect(
-                Collectors.groupingBy(
-                    ParsedLogData::getGroupByCategoryClass,
-                    LinkedHashMap::new,
-                    Collectors.toList()));
-
-    // Extract deltas
-    final List<ParsedLogData> rawDeltas =
-        partitioned.getOrDefault(ParsedPublishedDeltaData.class, Collections.emptyList());
-    final List<FileStatus> deltaFiles =
-        rawDeltas.stream()
-            .filter(ParsedLogData::isFile)
-            .map(ParsedLogData::getFileStatus)
-            .collect(Collectors.toList());
-
-    // Extract checkpoints
-    final List<FileStatus> checkpointFiles =
-        partitioned.getOrDefault(ParsedCheckpointData.class, Collections.emptyList()).stream()
-            .map(ParsedLogData::getFileStatus)
-            .collect(Collectors.toList());
-
-    // Extract compactions
-    final List<FileStatus> compactionFiles =
-        partitioned.getOrDefault(ParsedLogCompactionData.class, Collections.emptyList()).stream()
-            .map(ParsedLogData::getFileStatus)
-            .collect(Collectors.toList());
-
-    // Warning 5: sort deltas by version for contiguity
-    deltaFiles.sort(Comparator.comparingLong(f -> FileNames.deltaVersion(new Path(f.getPath()))));
-
-    // Warning 6: pick checksum by max version
-    final List<ParsedLogData> checksums =
-        partitioned.getOrDefault(ParsedChecksumData.class, Collections.emptyList());
-    final Optional<FileStatus> lastSeenChecksum =
-        checksums.stream()
-            .max(Comparator.comparingLong(ParsedLogData::getVersion))
-            .map(ParsedLogData::getFileStatus);
-
-    // Fix 4: allow checkpoint-only segments
-    checkArgument(
-        !deltaFiles.isEmpty() || !checkpointFiles.isEmpty(),
-        "Preloaded segment must contain at least " + "delta files or checkpoint files");
-
-    // Determine version from last delta or checkpoint
-    final long version;
-    final FileStatus lastDelta;
-    if (!deltaFiles.isEmpty()) {
-      lastDelta = ListUtils.getLast(deltaFiles);
-      version = FileNames.deltaVersion(new Path(lastDelta.getPath()));
-    } else {
-      lastDelta = null;
-      version =
-          checkpointFiles.stream()
-              .mapToLong(f -> FileNames.getFileVersion(new Path(f.getPath())))
-              .max()
-              .getAsLong();
-    }
-
-    // Determine max published delta version
-    final Optional<Long> maxPublishedDeltaVersion =
-        rawDeltas.stream()
-            .filter(d -> d instanceof ParsedPublishedDeltaData)
-            .map(ParsedLogData::getVersion)
-            .max(Long::compareTo);
-
-    return new LogSegment(
-        logPath,
-        version,
-        deltaFiles,
-        compactionFiles,
-        checkpointFiles,
-        lastDelta,
-        lastSeenChecksum,
-        maxPublishedDeltaVersion);
   }
 }

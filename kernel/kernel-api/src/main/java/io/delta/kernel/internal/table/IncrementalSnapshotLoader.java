@@ -36,6 +36,7 @@ import io.delta.kernel.internal.files.ParsedPublishedDeltaData;
 import io.delta.kernel.internal.fs.Path;
 import io.delta.kernel.internal.lang.ListUtils;
 import io.delta.kernel.internal.snapshot.LogSegment;
+import io.delta.kernel.internal.snapshot.SnapshotManager;
 import io.delta.kernel.internal.util.FileNames;
 import io.delta.kernel.internal.util.FileNames.DeltaLogFileType;
 import io.delta.kernel.internal.util.Tuple2;
@@ -110,10 +111,11 @@ final class IncrementalSnapshotLoader {
                 effectiveTarget,
                 true /* mustBeRecreatable */)
             .toInMemoryList();
+    final List<ParsedLogData> listedLogData =
+        listedStatuses.stream().map(ParsedLogData::forFileStatus).collect(Collectors.toList());
 
     final Map<Class<? extends ParsedLogData>, List<ParsedLogData>> partitioned =
-        listedStatuses.stream()
-            .map(ParsedLogData::forFileStatus)
+        listedLogData.stream()
             .collect(
                 Collectors.groupingBy(
                     ParsedLogData::getGroupByCategoryClass,
@@ -128,6 +130,15 @@ final class IncrementalSnapshotLoader {
     final List<FileStatus> compactionFiles =
         statusesFor(partitioned, ParsedLogCompactionData.class);
 
+    final Optional<CheckpointInstance> checkpoint =
+        latestCompleteCheckpoint(checkpointFiles, effectiveTarget);
+    final long checkpointVersion = checkpoint.map(instance -> instance.version).orElse(-1L);
+    if (checkpointVersion > baseVersion) {
+      return Optional.of(
+          new SnapshotManager(tablePath)
+              .assembleLogSegment(engine, listedLogData, catalogLogData, effectiveTarget));
+    }
+
     final List<ParsedDeltaData> allListedDeltas =
         combineDeltasWithCatalogPriority(
             publishedDeltas, catalogLogData, listingStart, effectiveTarget.orElse(Long.MAX_VALUE));
@@ -135,9 +146,6 @@ final class IncrementalSnapshotLoader {
       return emptyListingResult(effectiveTarget, baseVersion);
     }
 
-    final Optional<CheckpointInstance> checkpoint =
-        latestCompleteCheckpoint(checkpointFiles, effectiveTarget);
-    final long checkpointVersion = checkpoint.map(instance -> instance.version).orElse(-1L);
     final List<ParsedDeltaData> deltasAfterCheckpoint =
         allListedDeltas.stream()
             .filter(delta -> delta.getVersion() > checkpointVersion)
@@ -217,9 +225,6 @@ final class IncrementalSnapshotLoader {
             selectedChecksum,
             maxPublishedVersion);
 
-    if (checkpointVersion > baseVersion) {
-      return Optional.of(newlyListedSegment);
-    }
     return Optional.of(baseSegment.combineForIncrementalUpdate(newlyListedSegment, baseVersion));
   }
 

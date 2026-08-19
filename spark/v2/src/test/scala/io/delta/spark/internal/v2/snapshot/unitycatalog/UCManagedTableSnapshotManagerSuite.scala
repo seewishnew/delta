@@ -81,7 +81,7 @@ class UCManagedTableSnapshotManagerSuite
     withUCClientAndTestTable { (ucClient, tablePath, maxRatifiedVersion) =>
       val manager = createManager(ucClient, tablePath)
 
-      val snapshot = manager.loadLatestSnapshot()
+      val snapshot = manager.loadLatestSnapshot(engine)
 
       assert(snapshot.getVersion == maxRatifiedVersion)
       assert(ucClient.getLastGetCommitsTableIdentifier.getNamespace.toSeq == Seq("cat", "sch"))
@@ -101,7 +101,7 @@ class UCManagedTableSnapshotManagerSuite
     val manager = new UCManagedTableSnapshotManager(client, tableInfo, defaultEngine)
 
     val ex = intercept[RuntimeException] {
-      manager.loadLatestSnapshot()
+      manager.loadLatestSnapshot(engine)
     }
     assert(ex.getCause.isInstanceOf[InvalidTargetTableException])
   }
@@ -112,8 +112,8 @@ class UCManagedTableSnapshotManagerSuite
     withUCClientAndTestTable { (ucClient, tablePath, maxRatifiedVersion) =>
       val manager = createManager(ucClient, tablePath)
 
-      assert(manager.loadSnapshotAt(0L).getVersion == 0L)
-      assert(manager.loadSnapshotAt(1L).getVersion == 1L)
+      assert(manager.loadSnapshotAt(engine, 0L).getVersion == 0L)
+      assert(manager.loadSnapshotAt(engine, 1L).getVersion == 1L)
 
       intercept[IllegalArgumentException] { manager.loadSnapshotAt(-1L) }
       intercept[IllegalArgumentException] { manager.loadSnapshotAt(maxRatifiedVersion + 10) }
@@ -127,30 +127,30 @@ class UCManagedTableSnapshotManagerSuite
       val manager = createManager(ucClient, tablePath)
 
       // Valid versions including v0 do not throw
-      manager.checkVersionExists(
+      manager.checkVersionExists(engine, 
         0L,
         /* mustBeRecreatable= */ true,
         /* allowOutOfRange= */ false)
-      manager.checkVersionExists(
+      manager.checkVersionExists(engine, 
         maxRatifiedVersion,
         /* mustBeRecreatable= */ true,
         /* allowOutOfRange= */ false)
-      manager.checkVersionExists(
+      manager.checkVersionExists(engine, 
         maxRatifiedVersion - 1,
         /* mustBeRecreatable= */ true,
         /* allowOutOfRange= */ false)
-      manager.checkVersionExists(
+      manager.checkVersionExists(engine, 
         1L,
         /* mustBeRecreatable= */ true,
         /* allowOutOfRange= */ false)
-      manager.checkVersionExists(
+      manager.checkVersionExists(engine, 
         1L,
         /* mustBeRecreatable= */ false,
         /* allowOutOfRange= */ false)
 
       // Out-of-bounds versions throw
       val belowLowerBound = intercept[VersionNotFoundException] {
-        manager.checkVersionExists(
+        manager.checkVersionExists(engine, 
           -1L,
           /* mustBeRecreatable= */ true,
           /* allowOutOfRange= */ false)
@@ -160,7 +160,7 @@ class UCManagedTableSnapshotManagerSuite
       assert(belowLowerBound.getLatest == maxRatifiedVersion)
 
       val aboveUpperBound = intercept[VersionNotFoundException] {
-        manager.checkVersionExists(
+        manager.checkVersionExists(engine, 
           maxRatifiedVersion + 10,
           /* mustBeRecreatable= */ true,
           /* allowOutOfRange= */ false)
@@ -170,7 +170,7 @@ class UCManagedTableSnapshotManagerSuite
       assert(aboveUpperBound.getLatest == maxRatifiedVersion)
 
       // allowOutOfRange=true bypasses upper bound check
-      manager.checkVersionExists(
+      manager.checkVersionExists(engine, 
         maxRatifiedVersion + 10,
         /* mustBeRecreatable= */ true,
         /* allowOutOfRange= */ true)
@@ -320,13 +320,13 @@ class UCManagedTableSnapshotManagerSuite
     val client = new UCCatalogManagedClient(ucClient)
     val manager = new UCManagedTableSnapshotManager(client, tableInfo, defaultEngine)
 
-    val ex1 = intercept[RuntimeException] { manager.loadLatestSnapshot() }
+    val ex1 = intercept[RuntimeException] { manager.loadLatestSnapshot(engine) }
     assert(ex1.getCause.isInstanceOf[InvalidTargetTableException])
 
-    val ex2 = intercept[RuntimeException] { manager.loadSnapshotAt(0L) }
+    val ex2 = intercept[RuntimeException] { manager.loadSnapshotAt(engine, 0L) }
     assert(ex2.getCause.isInstanceOf[InvalidTargetTableException])
 
-    val ex3 = intercept[RuntimeException] { manager.checkVersionExists(0L, true, false) }
+    val ex3 = intercept[RuntimeException] { manager.checkVersionExists(engine, 0L, true, false) }
     assert(ex3.getCause.isInstanceOf[InvalidTargetTableException])
 
     val ex4 = intercept[RuntimeException] {

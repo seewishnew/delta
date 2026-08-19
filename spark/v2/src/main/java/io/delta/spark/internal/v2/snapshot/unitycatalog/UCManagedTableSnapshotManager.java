@@ -43,45 +43,47 @@ public class UCManagedTableSnapshotManager implements DeltaV2SnapshotManager {
   private final String tableId;
   private final String tablePath;
   private final UCTableIdentifier tableIdentifier;
-  private final Engine engine;
 
   /**
    * Creates a new UCManagedTableSnapshotManager.
    *
    * @param ucCatalogManagedClient the UC client
    * @param tableInfo UC table information
-   * @param engine Kernel engine for table operations
-   * @param catalogTable the Spark catalog table, if available
    */
   public UCManagedTableSnapshotManager(
-      UCCatalogManagedClient ucCatalogManagedClient, UCTableInfo tableInfo, Engine engine) {
+      UCCatalogManagedClient ucCatalogManagedClient,
+      UCTableInfo tableInfo) {
     this.ucCatalogManagedClient =
-        requireNonNull(ucCatalogManagedClient, "ucCatalogManagedClient is null");
+        requireNonNull(
+            ucCatalogManagedClient, "ucCatalogManagedClient is null");
     requireNonNull(tableInfo, "tableInfo is null");
     this.tableId = tableInfo.getTableId();
     this.tablePath = tableInfo.getTablePath();
     this.tableIdentifier = tableInfo.getTableIdentifier();
-    this.engine = requireNonNull(engine, "engine is null");
   }
 
   /**
    * Loads and returns the latest snapshot of the UC-managed Delta table.
    *
+   * @param engine the engine for executing operations
    * @return the latest snapshot of the table
    */
   @Override
-  public Snapshot loadLatestSnapshot() {
-    SnapshotImpl kernelSnapshot = loadKernelSnapshot(Optional.empty());
+  public Snapshot loadLatestSnapshot(Engine engine) {
+    SnapshotImpl kernelSnapshot =
+        loadKernelSnapshot(engine, Optional.empty());
     return wrapKernelSnapshot(kernelSnapshot);
   }
 
   @Override
-  public Snapshot loadSnapshotAt(long version) {
-    SnapshotImpl kernelSnapshot = loadKernelSnapshot(Optional.of(version));
+  public Snapshot loadSnapshotAt(Engine engine, long version) {
+    SnapshotImpl kernelSnapshot =
+        loadKernelSnapshot(engine, Optional.of(version));
     return wrapKernelSnapshot(kernelSnapshot);
   }
 
-  private SnapshotImpl loadKernelSnapshot(Optional<Long> versionOpt) {
+  private SnapshotImpl loadKernelSnapshot(
+      Engine engine, Optional<Long> versionOpt) {
     return (SnapshotImpl)
         ucCatalogManagedClient.loadSnapshot(
             engine,
@@ -113,12 +115,15 @@ public class UCManagedTableSnapshotManager implements DeltaV2SnapshotManager {
    */
   @Override
   public DeltaHistoryManager.Commit getActiveCommitAtTime(
+      Engine engine,
       long timestampMillis,
       boolean canReturnLastCommit,
       boolean mustBeRecreatable,
       boolean canReturnEarliestCommit) {
-    SnapshotImpl snapshot = loadKernelSnapshot(Optional.empty());
-    List<ParsedCatalogCommitData> catalogCommits = snapshot.getLogSegment().getAllCatalogCommits();
+    SnapshotImpl snapshot =
+        loadKernelSnapshot(engine, Optional.empty());
+    List<ParsedCatalogCommitData> catalogCommits =
+        snapshot.getLogSegment().getAllCatalogCommits();
     return DeltaHistoryManager.getActiveCommitAtTimestamp(
         engine,
         snapshot,
@@ -144,33 +149,45 @@ public class UCManagedTableSnapshotManager implements DeltaV2SnapshotManager {
    *     criteria
    */
   @Override
-  public void checkVersionExists(long version, boolean mustBeRecreatable, boolean allowOutOfRange)
+  public void checkVersionExists(
+      Engine engine,
+      long version,
+      boolean mustBeRecreatable,
+      boolean allowOutOfRange)
       throws VersionNotFoundException {
     // Load latest to get the current version bounds
-    SnapshotImpl snapshot = loadKernelSnapshot(Optional.empty());
-    // Latest version visible in this UC-managed snapshot.
+    SnapshotImpl snapshot =
+        loadKernelSnapshot(engine, Optional.empty());
     long latestSnapshotVersion = snapshot.getVersion();
 
-    // Fast path: check upper bound before expensive filesystem operations
+    // Fast path: check upper bound before expensive FS operations
     if ((version > latestSnapshotVersion) && !allowOutOfRange) {
-      throw new VersionNotFoundException(version, 0 /* earliest */, latestSnapshotVersion);
+      throw new VersionNotFoundException(
+          version, 0 /* earliest */, latestSnapshotVersion);
     }
 
-    // Get the earliest version among catalog commits. This bounds the Kernel's filesystem search
-    // for the earliest available version (e.g., if catalog has v0, no filesystem search is needed).
-    List<ParsedCatalogCommitData> catalogCommits = snapshot.getLogSegment().getAllCatalogCommits();
+    // Get the earliest version among catalog commits.
+    List<ParsedCatalogCommitData> catalogCommits =
+        snapshot.getLogSegment().getAllCatalogCommits();
     Optional<Long> earliestCatalogCommitVersion =
-        catalogCommits.stream().map(ParsedCatalogCommitData::getVersion).min(Long::compare);
+        catalogCommits.stream()
+            .map(ParsedCatalogCommitData::getVersion)
+            .min(Long::compare);
 
     long earliestVersion =
         mustBeRecreatable
             ? DeltaHistoryManager.getEarliestRecreatableCommit(
-                engine, snapshot.getLogPath(), earliestCatalogCommitVersion)
+                engine,
+                snapshot.getLogPath(),
+                earliestCatalogCommitVersion)
             : DeltaHistoryManager.getEarliestDeltaFile(
-                engine, snapshot.getLogPath(), earliestCatalogCommitVersion);
+                engine,
+                snapshot.getLogPath(),
+                earliestCatalogCommitVersion);
 
     if (version < earliestVersion) {
-      throw new VersionNotFoundException(version, earliestVersion, latestSnapshotVersion);
+      throw new VersionNotFoundException(
+          version, earliestVersion, latestSnapshotVersion);
     }
   }
 

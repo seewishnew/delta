@@ -108,13 +108,13 @@ public class DeltaV2WriteTest extends DeltaV2TestBase {
         DataTypes.createStructType(
             new StructField[] {DataTypes.createStructField("name", DataTypes.StringType, true)});
     PathBasedSnapshotManager mgr =
-        new PathBasedSnapshotManager(path, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(path);
     DeltaV2Write write =
         new DeltaV2Write(
             defaultEngine,
             spark.sessionState().newHadoopConf(),
             path,
-            DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot()),
+            DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot(engine)),
             mgr,
             dataSchema,
             partitionSchema,
@@ -154,13 +154,13 @@ public class DeltaV2WriteTest extends DeltaV2TestBase {
               DataTypes.createStructField("p2", DataTypes.IntegerType, true)
             });
     PathBasedSnapshotManager mgr =
-        new PathBasedSnapshotManager(path, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(path);
     DeltaV2Write write =
         new DeltaV2Write(
             defaultEngine,
             spark.sessionState().newHadoopConf(),
             path,
-            DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot()),
+            DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot(engine)),
             mgr,
             dataSchema,
             partitionSchema,
@@ -185,9 +185,9 @@ public class DeltaV2WriteTest extends DeltaV2TestBase {
 
   private DeltaV2Write newWrite(String path, CaseInsensitiveStringMap options) {
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(path, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(path);
     Snapshot snapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadLatestSnapshot());
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadLatestSnapshot(engine));
     LogicalWriteInfo info = WriteTestUtils.logicalWriteInfo(TABLE_SCHEMA, options);
     return new DeltaV2Write(
         defaultEngine,

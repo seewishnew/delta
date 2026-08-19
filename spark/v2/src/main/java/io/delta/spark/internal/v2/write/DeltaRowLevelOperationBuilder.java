@@ -18,7 +18,6 @@ package io.delta.spark.internal.v2.write;
 import static java.util.Objects.requireNonNull;
 
 import io.delta.kernel.Snapshot;
-import io.delta.kernel.engine.Engine;
 import io.delta.spark.internal.v2.catalog.DeltaV2Table;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.connector.expressions.FieldReference;
@@ -36,47 +35,47 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 public class DeltaRowLevelOperationBuilder implements RowLevelOperationBuilder {
 
   private final DeltaV2Table table;
-  private final Engine engine;
   private final Configuration hadoopConf;
   private final Snapshot initialSnapshot;
   private final RowLevelOperationInfo info;
 
   public DeltaRowLevelOperationBuilder(
       DeltaV2Table table,
-      Engine engine,
       Configuration hadoopConf,
       Snapshot initialSnapshot,
       RowLevelOperationInfo info) {
     this.table = requireNonNull(table, "table is null");
-    this.engine = requireNonNull(engine, "engine is null");
-    this.hadoopConf = requireNonNull(hadoopConf, "hadoopConf is null");
-    this.initialSnapshot = requireNonNull(initialSnapshot, "initialSnapshot is null");
+    this.hadoopConf =
+        requireNonNull(hadoopConf, "hadoopConf is null");
+    this.initialSnapshot =
+        requireNonNull(initialSnapshot, "initialSnapshot is null");
     this.info = requireNonNull(info, "info is null");
   }
 
   @Override
   public RowLevelOperation build() {
-    return new CopyOnWriteOperation(table, engine, hadoopConf, initialSnapshot, info);
+    return new CopyOnWriteOperation(
+        table, hadoopConf, initialSnapshot, info);
   }
 
-  private static class CopyOnWriteOperation implements RowLevelOperation {
+  private static class CopyOnWriteOperation
+      implements RowLevelOperation {
 
     private final DeltaV2Table table;
-    private final Engine engine;
     private final Configuration hadoopConf;
     private final Snapshot initialSnapshot;
     private final RowLevelOperationInfo info;
 
     private CopyOnWriteOperation(
         DeltaV2Table table,
-        Engine engine,
         Configuration hadoopConf,
         Snapshot initialSnapshot,
         RowLevelOperationInfo info) {
       this.table = requireNonNull(table, "table is null");
-      this.engine = requireNonNull(engine, "engine is null");
-      this.hadoopConf = requireNonNull(hadoopConf, "hadoopConf is null");
-      this.initialSnapshot = requireNonNull(initialSnapshot, "initialSnapshot is null");
+      this.hadoopConf =
+          requireNonNull(hadoopConf, "hadoopConf is null");
+      this.initialSnapshot =
+          requireNonNull(initialSnapshot, "initialSnapshot is null");
       this.info = requireNonNull(info, "info is null");
     }
 

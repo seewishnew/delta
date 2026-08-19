@@ -808,7 +808,7 @@ class DeltaV2MicroBatchStream
     if (options.startingVersion().isDefined()) {
       DeltaStartingVersion startingVersion = options.startingVersion().get();
       if (startingVersion instanceof StartingVersionLatest$) {
-        Snapshot latestSnapshot = snapshotManager.loadLatestSnapshot();
+        Snapshot latestSnapshot = snapshotManager.loadLatestSnapshot(engine);
         // "latest": start reading from the next commit
         cachedStartingVersion = Optional.of(latestSnapshot.getVersion() + 1);
         return cachedStartingVersion;
@@ -821,7 +821,8 @@ class DeltaV2MicroBatchStream
           // check is skipped, so this is technically not safe, but we keep it this way for
           // historical reasons.
           snapshotManager.checkVersionExists(
-              version, /* mustBeRecreatable= */ false, allowOutOfRange);
+              engine, version,
+              /* mustBeRecreatable= */ false, allowOutOfRange);
         }
         cachedStartingVersion = Optional.of(version);
         return cachedStartingVersion;
@@ -862,11 +863,13 @@ class DeltaV2MicroBatchStream
     // TODO(#5999): optimize duplicate loadLatestSnapshot calls
     DeltaHistoryManager.Commit commit =
         snapshotManager.getActiveCommitAtTime(
+            engine,
             timestamp.getTime(),
             /* canReturnLastCommit= */ true,
             /* mustBeRecreatable= */ false,
             /* canReturnEarliestCommit= */ true);
-    long latestVersion = snapshotManager.loadLatestSnapshot().getVersion();
+    long latestVersion =
+        snapshotManager.loadLatestSnapshot(engine).getVersion();
     long startingVersion =
         DeltaStreamUtils.getStartingVersionFromCommitAtTimestamp(
             /* timeZone= */ spark.sessionState().conf().sessionLocalTimeZone(),
@@ -907,7 +910,7 @@ class DeltaV2MicroBatchStream
       // Attempt to construct a snapshot at the startingVersion to validate the protocol
       // If snapshot reconstruction fails, fall back to old behavior where the only
       // requirement was for the commit to exist
-      snapshotManager.loadSnapshotAt(version);
+      snapshotManager.loadSnapshotAt(engine, version);
       return true;
     } catch (UnsupportedTableFeatureException e) {
       // Re-throw fatal unsupported table feature exceptions
@@ -1133,7 +1136,7 @@ class DeltaV2MicroBatchStream
       try {
         startSnapshot =
             DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
-                snapshotManager.loadSnapshotAt(startVersion));
+                snapshotManager.loadSnapshotAt(engine, startVersion));
       } catch (io.delta.kernel.exceptions.KernelException e) {
         // startVersion may not yet exist (e.g. startingVersion=latest resolves to latest+1).
         // TODO(#6745): narrow this catch once kernel exposes a specific exception subclass
@@ -1195,7 +1198,8 @@ class DeltaV2MicroBatchStream
         // 2. buildOffsetFromIndexedFile bumps the version up by one when we hit the END_INDEX.
         // TODO(#5318): consider caching the latest version to avoid loading a new snapshot.
         // TODO(#5318): kernel should ideally relax this constraint.
-        endVersionOpt = Optional.of(snapshotManager.loadLatestSnapshot().getVersion());
+        endVersionOpt = Optional.of(
+            snapshotManager.loadLatestSnapshot(engine).getVersion());
       }
 
       // After capping, check if startVersion is beyond the endVersion.
@@ -1208,7 +1212,8 @@ class DeltaV2MicroBatchStream
       // When endOffset is empty (offset discovery), check if startVersion exceeds the current
       // latest version. We must load the current latest (not snapshotAtSourceInit) because new
       // commits may have arrived since stream initialization.
-      long currentLatestVersion = snapshotManager.loadLatestSnapshot().getVersion();
+      long currentLatestVersion =
+          snapshotManager.loadLatestSnapshot(engine).getVersion();
       if (startVersion > currentLatestVersion) {
         return Utils.toCloseableIterator(Collections.emptyIterator());
       }
@@ -1703,7 +1708,7 @@ class DeltaV2MicroBatchStream
     try {
       startVersionSnapshot =
           DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
-              snapshotManager.loadSnapshotAt(batchStartVersion));
+              snapshotManager.loadSnapshotAt(engine, batchStartVersion));
     } catch (Exception e) {
       err = e;
     }
@@ -1876,7 +1881,7 @@ class DeltaV2MicroBatchStream
     // May differ from snapshotAtSourceInit on checkpoint restart. loadSnapshotAt is
     // metadata-only on driver; log replay runs on executors via ScanFileRDD.
     SnapshotImpl snapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(version));
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(engine, version));
     SerializableReadOnlySnapshot serSnapshot =
         SerializableReadOnlySnapshot.fromSnapshot(snapshot, hadoopConf);
 
@@ -1958,7 +1963,7 @@ class DeltaV2MicroBatchStream
   /** Loads snapshot files at the specified version. */
   private InitialSnapshotCache loadAndValidateSnapshot(long version) {
     SnapshotImpl snapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(version));
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(engine, version));
     // If schema tracking is already active and the initial snapshot has advanced since the tracked
     // read snapshot, replace the tracked metadata/protocol before reading snapshot files.
     if (metadataEvolutionHandler.shouldTrackMetadataChange()

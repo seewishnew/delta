@@ -22,6 +22,7 @@ import io.delta.kernel.data.Row;
 import io.delta.kernel.engine.Engine;
 import io.delta.kernel.internal.util.Utils;
 import io.delta.kernel.utils.CloseableIterable;
+import io.delta.spark.internal.v2.kernel.KernelEngineFactory;
 import io.delta.spark.internal.v2.utils.SerializableKernelRowWrapper;
 import java.util.ArrayList;
 import java.util.List;
@@ -58,16 +59,17 @@ class DeltaV2BatchWrite implements Write, BatchWrite {
   private final DeltaV2BatchWriteContext context;
 
   DeltaV2BatchWrite(
-      Engine engine,
       Configuration hadoopConf,
       String tablePath,
       Snapshot initialSnapshot,
       StructType dataSchema,
       StructType partitionSchema,
       LogicalWriteInfo writeInfo) {
+    Engine engine = KernelEngineFactory.createDefaultEngine(hadoopConf);
     this.context =
         DeltaV2BatchWriteContext.create(
-            engine, hadoopConf, tablePath, initialSnapshot, dataSchema, partitionSchema, writeInfo);
+            engine, hadoopConf, tablePath, initialSnapshot,
+            dataSchema, partitionSchema, writeInfo);
   }
 
   @Override

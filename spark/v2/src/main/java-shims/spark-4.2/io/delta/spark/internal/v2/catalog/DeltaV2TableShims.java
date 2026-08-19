@@ -16,13 +16,14 @@
 
 package io.delta.spark.internal.v2.catalog;
 
-import io.delta.kernel.engine.Engine;
 import io.delta.kernel.internal.SnapshotImpl;
+import io.delta.spark.internal.v2.kernel.KernelEngineFactory;
 import org.apache.spark.sql.delta.ColumnTypeChangeSupport;
 import org.apache.spark.sql.delta.v2.interop.AbstractMetadata;
 import org.apache.spark.sql.delta.v2.interop.AbstractProtocol;
 import io.delta.spark.internal.v2.utils.ScalaUtils;
 import io.delta.spark.internal.v2.write.DeltaMetadataOnlyDeleteExecutor;
+import org.apache.hadoop.conf.Configuration;
 import java.util.Arrays;
 import java.util.Optional;
 import org.apache.spark.sql.SparkSession;
@@ -46,7 +47,7 @@ public abstract class DeltaV2TableShims implements SupportsSchemaEvolution, Supp
   /** Implemented in DeltaV2Table to provide access to the table protocol/metadata. */
   protected abstract AbstractProtocol protocol();
   protected abstract AbstractMetadata metadata();
-  protected abstract Engine kernelEngine();
+  protected abstract Configuration hadoopConf();
   protected abstract SnapshotImpl initialSnapshot();
   protected abstract Optional<CatalogTable> catalogTable();
 
@@ -90,7 +91,9 @@ public abstract class DeltaV2TableShims implements SupportsSchemaEvolution, Supp
 
   @Override
   public void deleteWhere(Predicate[] predicates) {
-    DeltaMetadataOnlyDeleteExecutor.deleteWhere(
-        kernelEngine(), initialSnapshot(), catalogTable(), predicates);
+    KernelEngineFactory.runWithDefaultEngine(
+        hadoopConf(),
+        engine -> DeltaMetadataOnlyDeleteExecutor.deleteWhere(
+            engine, initialSnapshot(), catalogTable(), predicates));
   }
 }

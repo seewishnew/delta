@@ -109,7 +109,7 @@ public class DeltaRowLevelOperationBuilderTest extends DeltaV2TestBase {
     Engine engine = DefaultEngine.create(hadoopConf);
     Snapshot snapshot =
         DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
-            new PathBasedSnapshotManager(tempDir.getAbsolutePath(), engine).loadLatestSnapshot());
+            new PathBasedSnapshotManager(tempDir.getAbsolutePath()).loadLatestSnapshot(engine));
 
     assertThrows(
         NullPointerException.class,
@@ -142,8 +142,8 @@ public class DeltaRowLevelOperationBuilderTest extends DeltaV2TestBase {
     Engine engine = DefaultEngine.create(hadoopConf);
     Snapshot snapshot =
         DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
-            new PathBasedSnapshotManager(table.getTablePath().toString(), engine)
-                .loadLatestSnapshot());
+            new PathBasedSnapshotManager(table.getTablePath().toString())
+                .loadLatestSnapshot(engine));
     return new DeltaRowLevelOperationBuilder(
         table, engine, hadoopConf, snapshot, testInfo(command));
   }

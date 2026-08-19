@@ -127,7 +127,6 @@ public class DeltaV2Table extends DeltaV2TableShims
   private final Snapshot initialSnapshot;
 
   private final Configuration hadoopConf;
-  private final Engine kernelEngine;
 
   private final SchemaProvider schemaProvider;
   private final Optional<CatalogTable> catalogTable;
@@ -249,60 +248,61 @@ public class DeltaV2Table extends DeltaV2TableShims
     this.options = Collections.unmodifiableMap(merged);
 
     this.hadoopConf =
-        SparkSession.active().sessionState().newHadoopConfWithOptions(toScalaMap(options));
-    Engine createdEngine = null;
+        SparkSession.active().sessionState().newHadoopConfWithOptions(
+            toScalaMap(options));
+    this.snapshotManager =
+        SnapshotManagerFactory.create(tablePath, catalogTable);
     try {
-      createdEngine = KernelEngineFactory.createDefaultEngine(this.hadoopConf);
-      this.kernelEngine = createdEngine;
-      this.snapshotManager = SnapshotManagerFactory.create(tablePath, kernelEngine, catalogTable);
-      try {
-        this.initialSnapshot =
-            timeTravelVersion.isPresent()
-                ? loadSnapshotAtCheckedVersion(snapshotManager, timeTravelVersion.getAsLong())
-                : snapshotManager.loadLatestSnapshot();
-      } catch (io.delta.kernel.exceptions.TableNotFoundException e) {
-        // Rethrow as the Delta-module wrapper so catalog/interop layer never names a Kernel type.
-        throw new TableNotFoundException(tablePath);
-      } catch (io.delta.kernel.exceptions.KernelException e) {
-        // Missing earliest commit file surfaces as a base KernelException, so match on its message.
-        String reason = e.getMessage();
-        if (reason != null && reason.contains("Missing delta file")) {
-          throw new NoRecreatableHistoryException(tablePath);
-        }
-        throw e;
+      this.initialSnapshot =
+          KernelEngineFactory.withDefaultEngine(
+              hadoopConf,
+              engine ->
+                  timeTravelVersion.isPresent()
+                      ? loadSnapshotAtCheckedVersion(
+                          snapshotManager, engine,
+                          timeTravelVersion.getAsLong())
+                      : snapshotManager.loadLatestSnapshot(engine));
+    } catch (io.delta.kernel.exceptions.TableNotFoundException e) {
+      throw new TableNotFoundException(tablePath);
+    } catch (io.delta.kernel.exceptions.KernelException e) {
+      String reason = e.getMessage();
+      if (reason != null && reason.contains("Missing delta file")) {
+        throw new NoRecreatableHistoryException(tablePath);
       }
-
-      this.isCDCRead = CDCReader.isCDCRead(new CaseInsensitiveStringMap(this.options));
-      this.isTimeTravel = timeTravelVersion.isPresent();
-
-      Optional<PersistedMetadata> persistedMetadata =
-          MetadataEvolutionHandler.getPersistedMetadataForMicroBatchStream(
-              SparkSession.active(), initialSnapshot, options, snapshotManager, kernelEngine);
-
-      StructType rawSchema;
-      List<String> partitionColumnNames;
-      if (persistedMetadata.isPresent()) {
-        PersistedMetadata persisted = persistedMetadata.get();
-        rawSchema = persisted.dataSchema();
-        partitionColumnNames = Arrays.asList(persisted.partitionSchema().fieldNames());
-      } else {
-        rawSchema = initialSnapshot.schema();
-        partitionColumnNames = new ArrayList<>(initialSnapshot.getPartitionColumnNames());
-      }
-      // Schema-related metadata is lazily computed on first access within SchemaProvider
-      this.schemaProvider =
-          new SchemaProvider(SparkSession.active(), rawSchema, partitionColumnNames);
-    } catch (RuntimeException | Error exception) {
-      closeEngineAfterFailure(createdEngine, exception);
-      throw exception;
-    } finally {
+      throw e;
     }
-  }
 
-  private static void closeEngineAfterFailure(Engine engine, Throwable failure) {
-    if (engine == null) {
-      return;
+    this.isCDCRead =
+        CDCReader.isCDCRead(new CaseInsensitiveStringMap(this.options));
+    this.isTimeTravel = timeTravelVersion.isPresent();
+
+    Optional<PersistedMetadata> persistedMetadata =
+        KernelEngineFactory.withDefaultEngine(
+            hadoopConf,
+            engine ->
+                MetadataEvolutionHandler
+                    .getPersistedMetadataForMicroBatchStream(
+                        SparkSession.active(),
+                        initialSnapshot,
+                        options,
+                        snapshotManager,
+                        engine));
+
+    StructType rawSchema;
+    List<String> partitionColumnNames;
+    if (persistedMetadata.isPresent()) {
+      PersistedMetadata persisted = persistedMetadata.get();
+      rawSchema = persisted.dataSchema();
+      partitionColumnNames =
+          Arrays.asList(persisted.partitionSchema().fieldNames());
+    } else {
+      rawSchema = initialSnapshot.schema();
+      partitionColumnNames =
+          new ArrayList<>(initialSnapshot.getPartitionColumnNames());
     }
+    this.schemaProvider =
+        new SchemaProvider(
+            SparkSession.active(), rawSchema, partitionColumnNames);
   }
 
   /**
@@ -379,8 +379,8 @@ public class DeltaV2Table extends DeltaV2TableShims
   }
 
   /** Inputs exposed to the Spark-version shim for metadata-only DELETE. */
-  protected Engine kernelEngine() {
-    return kernelEngine;
+  protected Configuration hadoopConf() {
+    return hadoopConf;
   }
 
   protected SnapshotImpl initialSnapshot() {
@@ -400,32 +400,42 @@ public class DeltaV2Table extends DeltaV2TableShims
 
   /** Returns a copy of this table pinned to the snapshot active at {@code timestampMicros}. */
   public DeltaV2Table withTimestamp(long timestampMicros) {
-    return withVersion(resolveTimestampToVersion(snapshotManager, timestampMicros));
+    return withVersion(
+        KernelEngineFactory.withDefaultEngine(
+            hadoopConf,
+            engine -> resolveTimestampToVersion(
+                snapshotManager, engine, timestampMicros)));
   }
 
   /**
-   * Resolves a time travel timestamp to the active commit version using the Kernel snapshot
-   * manager.
+   * Resolves a time travel timestamp to the active commit version using
+   * the Kernel snapshot manager.
    *
-   * <p>This loads the latest snapshot more than once (here and inside the Kernel lookup), make it
-   * share a singular load once the snapshot manager exposes it TODO(#5999).
+   * <p>This loads the latest snapshot more than once (here and inside
+   * the Kernel lookup), make it share a singular load once the snapshot
+   * manager exposes it TODO(#5999).
    */
   private static long resolveTimestampToVersion(
-      DeltaV2SnapshotManager manager, long timestampMicros) {
+      DeltaV2SnapshotManager manager,
+      Engine engine,
+      long timestampMicros) {
     long timeMillis = timestampMicros / 1000;
     DeltaHistoryManager.Commit commit =
         manager.getActiveCommitAtTime(
+            engine,
             timeMillis,
             /* canReturnLastCommit = */ true,
             /* mustBeRecreatable = */ true,
             /* canReturnEarliestCommit = */ true);
-    long latestVersion = manager.loadLatestSnapshot().getVersion();
+    long latestVersion =
+        manager.loadLatestSnapshot(engine).getVersion();
     if (commit.getTimestamp() > timeMillis) {
-      // The earliest available commit is younger than the requested time.
-      throw new TimestampOutOfRangeException(timeMillis, commit.getTimestamp(), false);
-    } else if (commit.getVersion() == latestVersion && commit.getTimestamp() < timeMillis) {
-      // The requested time is after the latest commit.
-      throw new TimestampOutOfRangeException(timeMillis, commit.getTimestamp(), true);
+      throw new TimestampOutOfRangeException(
+          timeMillis, commit.getTimestamp(), false);
+    } else if (commit.getVersion() == latestVersion
+        && commit.getTimestamp() < timeMillis) {
+      throw new TimestampOutOfRangeException(
+          timeMillis, commit.getTimestamp(), true);
     }
     return commit.getVersion();
   }
@@ -556,7 +566,6 @@ public class DeltaV2Table extends DeltaV2TableShims
     return DeltaV2ScanUtils.newScanBuilder(
         name(),
         initialSnapshot,
-        kernelEngine,
         catalogTable,
         snapshotManager,
         schemaProvider.getDataSchema(),
@@ -567,20 +576,23 @@ public class DeltaV2Table extends DeltaV2TableShims
   }
 
   /**
-   * Validates that {@code version} exists in the Delta log, then loads the snapshot pinned to it.
+   * Validates that {@code version} exists in the Delta log, then loads
+   * the snapshot pinned to it.
    */
   private static Snapshot loadSnapshotAtCheckedVersion(
-      DeltaV2SnapshotManager manager, long version) {
+      DeltaV2SnapshotManager manager, Engine engine, long version) {
     manager.checkVersionExists(
-        version, /* mustBeRecreatable = */ true, /* allowOutOfRange = */ false);
-    return manager.loadSnapshotAt(version);
+        engine,
+        version,
+        /* mustBeRecreatable = */ true,
+        /* allowOutOfRange = */ false);
+    return manager.loadSnapshotAt(engine, version);
   }
 
   @Override
   public WriteBuilder newWriteBuilder(LogicalWriteInfo info) {
     requireNonNull(info, "write info is null");
     return new DeltaV2WriteBuilder(
-        kernelEngine,
         tablePath,
         hadoopConf,
         initialSnapshot,
@@ -596,11 +608,11 @@ public class DeltaV2Table extends DeltaV2TableShims
    * follow-up PR.
    */
   @Override
-  public RowLevelOperationBuilder newRowLevelOperationBuilder(RowLevelOperationInfo info) {
+  public RowLevelOperationBuilder newRowLevelOperationBuilder(
+      RowLevelOperationInfo info) {
     requireNonNull(info, "row-level operation info is null");
     return new DeltaRowLevelOperationBuilder(
         this,
-        kernelEngine,
         hadoopConf,
         DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(initialSnapshot),
         info);

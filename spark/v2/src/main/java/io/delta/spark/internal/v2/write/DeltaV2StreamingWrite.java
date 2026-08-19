@@ -27,7 +27,9 @@ import io.delta.kernel.internal.SnapshotImpl;
 import io.delta.kernel.internal.actions.Protocol;
 import io.delta.kernel.types.StructType;
 import io.delta.kernel.utils.CloseableIterable;
+import io.delta.spark.internal.v2.kernel.KernelEngineFactory;
 import java.util.function.Function;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.connector.write.PhysicalWriteInfo;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.connector.write.streaming.StreamingDataWriterFactory;
@@ -59,44 +61,56 @@ import org.slf4j.LoggerFactory;
  */
 class DeltaV2StreamingWrite implements StreamingWrite {
 
-  private static final Logger logger = LoggerFactory.getLogger(DeltaV2StreamingWrite.class);
+  private static final Logger logger =
+      LoggerFactory.getLogger(DeltaV2StreamingWrite.class);
 
-  private final Engine engine;
+  private final Configuration hadoopConf;
   private final DeltaV2SnapshotManager snapshotManager;
   private final String queryId;
   private final DeltaV2DataWriterFactory dataWriterFactory;
-  // The write state's schema/protocol baseline; the per-epoch guard fails if the table diverges.
   private final StructType writeSchema;
   private final Protocol writeProtocol;
 
   /**
-   * @param engine Kernel engine (driver-only)
-   * @param initialSnapshot the batch's planned snapshot; write-state source and guard baseline
-   * @param snapshotManager reloads the latest snapshot per epoch (see {@link #commit})
-   * @param queryId streaming query id; the transaction application id for cross-restart idempotency
-   * @param dataWriterFactoryBuilder builds the executor write state; supplied by {@link
-   *     DeltaV2Write} to share construction with the batch path
+   * @param hadoopConf Hadoop configuration per-operation engines are
+   *     built from
+   * @param initialSnapshot the batch's planned snapshot; write-state
+   *     source and guard baseline
+   * @param snapshotManager reloads the latest snapshot per epoch
+   * @param queryId streaming query id; the transaction application id
+   *     for cross-restart idempotency
+   * @param dataWriterFactoryBuilder builds the executor write state
    */
   DeltaV2StreamingWrite(
-      Engine engine,
+      Configuration hadoopConf,
       Snapshot initialSnapshot,
       DeltaV2SnapshotManager snapshotManager,
       String queryId,
       Function<Transaction, DeltaV2DataWriterFactory> dataWriterFactoryBuilder) {
-    this.engine = requireNonNull(engine, "engine is null");
+    this.hadoopConf =
+        requireNonNull(hadoopConf, "hadoopConf is null");
     requireNonNull(initialSnapshot, "initialSnapshot is null");
-    this.snapshotManager = requireNonNull(snapshotManager, "snapshotManager is null");
+    this.snapshotManager =
+        requireNonNull(snapshotManager, "snapshotManager is null");
     this.queryId = requireNonNull(queryId, "queryId is null");
-    requireNonNull(dataWriterFactoryBuilder, "dataWriterFactoryBuilder is null");
+    requireNonNull(
+        dataWriterFactoryBuilder,
+        "dataWriterFactoryBuilder is null");
     this.writeSchema = initialSnapshot.getSchema();
-    this.writeProtocol = ((SnapshotImpl) initialSnapshot).getProtocol();
-    // We only need this transaction's serialized write context for the factory, not the commit
-    // (commit() builds its own per epoch).
-    Transaction stateTxn =
-        initialSnapshot
-            .buildUpdateTableTransaction(DeltaV2Write.getEngineInfo(), Operation.STREAMING_UPDATE)
-            .build(engine);
-    this.dataWriterFactory = dataWriterFactoryBuilder.apply(stateTxn);
+    this.writeProtocol =
+        ((SnapshotImpl) initialSnapshot).getProtocol();
+    this.dataWriterFactory =
+        KernelEngineFactory.withDefaultEngine(
+            hadoopConf,
+            engine -> {
+              Transaction stateTxn =
+                  initialSnapshot
+                      .buildUpdateTableTransaction(
+                          DeltaV2Write.getEngineInfo(),
+                          Operation.STREAMING_UPDATE)
+                      .build(engine);
+              return dataWriterFactoryBuilder.apply(stateTxn);
+            });
   }
 
   @Override
@@ -111,43 +125,49 @@ class DeltaV2StreamingWrite implements StreamingWrite {
 
   @Override
   public void commit(long epochId, WriterCommitMessage[] messages) {
-    // Kernel-only: needs SnapshotImpl.buildUpdateTableTransaction
-    // (TransactionBuilder) for the streaming commit, and
-    // getLatestTransactionVersion for the epoch-skip check.
-    SnapshotImpl latestSnapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadLatestSnapshot());
+    KernelEngineFactory.runWithDefaultEngine(
+        hadoopConf, engine -> commitEpoch(engine, epochId, messages));
+  }
 
-    // TODO(#7140): no implicit type cast and mergeSchema. Fail loudly on a concurrent
-    // schema/protocol change.
+  private void commitEpoch(
+      Engine engine, long epochId, WriterCommitMessage[] messages) {
+    SnapshotImpl latestSnapshot =
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
+            snapshotManager.loadLatestSnapshot(engine));
+
     assertSchemaAndProtocolUnchanged(latestSnapshot);
 
-    // TODO(#7140): no self-scan guard. A stream reading and writing the same table commits
-    //  as a blind append, skipping the conflict check V1 gets via readWholeTable().
-
-    // Skip an already-committed epoch. Its executor-written files are then orphaned (VACUUM'd).
     long committedEpoch =
-        ((SnapshotImpl) latestSnapshot).getLatestTransactionVersion(engine, queryId).orElse(-1L);
+        ((SnapshotImpl) latestSnapshot)
+            .getLatestTransactionVersion(engine, queryId)
+            .orElse(-1L);
     if (committedEpoch >= epochId) {
-      logger.info("Skipping already committed epoch {} for query {}", epochId, queryId);
+      logger.info(
+          "Skipping already committed epoch {} for query {}",
+          epochId, queryId);
       return;
     }
 
     try {
       Transaction txn =
           latestSnapshot
-              .buildUpdateTableTransaction(DeltaV2Write.getEngineInfo(), Operation.STREAMING_UPDATE)
+              .buildUpdateTableTransaction(
+                  DeltaV2Write.getEngineInfo(),
+                  Operation.STREAMING_UPDATE)
               .withTransactionId(queryId, epochId)
               .build(engine);
-      CloseableIterable<Row> dataActions = DeltaV2WriterCommitMessage.toDataActions(messages);
-      long version = txn.commit(engine, dataActions).getVersion();
+      CloseableIterable<Row> dataActions =
+          DeltaV2WriterCommitMessage.toDataActions(messages);
+      long version =
+          txn.commit(engine, dataActions).getVersion();
       logger.info(
-          "DSv2 streaming epoch {} for query {} committed at version {}",
-          epochId,
-          queryId,
-          version);
+          "DSv2 streaming epoch {} for query {} committed"
+              + " at version {}",
+          epochId, queryId, version);
     } catch (ConcurrentTransactionException e) {
-      // Backstop for a concurrent writer racing the same epoch between the pre-check and commit.
-      logger.info("Skipping already committed epoch {} for query {}", epochId, queryId);
+      logger.info(
+          "Skipping already committed epoch {} for query {}",
+          epochId, queryId);
     }
   }
 

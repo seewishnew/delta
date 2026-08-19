@@ -20,7 +20,6 @@ import java.util.{Locale, Objects, Optional, OptionalInt}
 import java.util.function.Supplier
 
 import org.apache.spark.sql.delta.Snapshot
-import io.delta.kernel.engine.Engine
 import io.delta.spark.internal.v2.read.cdc.CDCSchemaContext
 
 import org.apache.spark.sql.delta.stats.DeltaScan
@@ -50,7 +49,6 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
  *
  * @param tableName the name of the table (used only for identification)
  * @param initialSnapshot Kernel snapshot created during connector setup
- * @param kernelEngine the Kernel engine used to read scan files
  * @param catalogTable the catalog table this scan resolved from, if any
  * @param snapshotManager the snapshot manager for this table
  * @param dataSchema the data schema (non-partition columns)
@@ -62,7 +60,6 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
 private[read] class DeltaV2ScanBuilder(
     tableName: String,
     initialSnapshot: Snapshot,
-    kernelEngine: Engine,
     catalogTable: Optional[CatalogTable],
     snapshotManager: DeltaV2SnapshotManager,
     dataSchema: StructType,
@@ -78,7 +75,6 @@ private[read] class DeltaV2ScanBuilder(
   // Use Objects.requireNonNull (throws NullPointerException) rather than Scala's require (throws
   // IllegalArgumentException) to preserve the exact null-check behavior of the original Java class.
   Objects.requireNonNull(initialSnapshot, "initialSnapshot is null")
-  Objects.requireNonNull(kernelEngine, "kernelEngine is null")
   Objects.requireNonNull(catalogTable, "catalogTable is null")
   Objects.requireNonNull(snapshotManager, "snapshotManager is null")
   Objects.requireNonNull(dataSchema, "dataSchema is null")
@@ -235,7 +231,6 @@ private[read] object DeltaV2ScanBuilder {
   def create(
       tableName: String,
       initialSnapshot: Snapshot,
-      kernelEngine: Engine,
       catalogTable: Optional[CatalogTable],
       snapshotManager: DeltaV2SnapshotManager,
       dataSchema: StructType,
@@ -246,7 +241,6 @@ private[read] object DeltaV2ScanBuilder {
     new DeltaV2ScanBuilder(
       tableName,
       initialSnapshot,
-      kernelEngine,
       catalogTable,
       snapshotManager,
       dataSchema,
@@ -267,7 +261,6 @@ private[read] object DeltaV2ScanBuilder {
    *
    * @param tableName the table name (used only for identification)
    * @param snapshot the Kernel snapshot to read
-   * @param kernelEngine the Kernel engine
    * @param snapshotManager the snapshot manager for this table
    * @param dataSchema the data schema (non-partition columns)
    * @param partitionSchema the partition schema
@@ -279,18 +272,15 @@ private[read] object DeltaV2ScanBuilder {
   def forUnfilteredScan(
       tableName: String,
       snapshot: Snapshot,
-      kernelEngine: Engine,
       snapshotManager: DeltaV2SnapshotManager,
       dataSchema: StructType,
       partitionSchema: StructType,
       tableSchema: StructType,
       requiredSchema: StructType,
       catalogStats: Optional[Statistics]): Scan = {
-    // No CatalogTable: a full-table, no-filter scan does not use catalogTable (it only feeds the
     val builder = new DeltaV2ScanBuilder(
       tableName,
       snapshot,
-      kernelEngine,
       Optional.empty[CatalogTable](),
       snapshotManager,
       dataSchema,

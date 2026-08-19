@@ -197,9 +197,9 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
   private HandlerWithLog buildHandlerWithRealTable(
       String tablePath, long initVersion, boolean seedLogWithInitEntry) {
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(tablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(tablePath);
     SnapshotImpl snapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(initVersion));
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(engine, initVersion));
     Metadata tableMetadata = snapshot.getMetadata();
     Protocol tableProtocol = snapshot.getProtocol();
     KernelMetadataAdapter adapter = new KernelMetadataAdapter(tableMetadata);
@@ -997,8 +997,8 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
     String tableName = "t_" + UUID.randomUUID().toString().replace('-', '_');
     createEmptyTestTable(tablePath, tableName);
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(tablePath, spark.sessionState().newHadoopConf());
-    Snapshot snapshot = snapshotManager.loadLatestSnapshot();
+        new PathBasedSnapshotManager(tablePath);
+    Snapshot snapshot = snapshotManager.loadLatestSnapshot(engine);
     return MetadataEvolutionHandler.getMetadataTrackingLogForMicroBatchStream(
         spark,
         snapshot,
@@ -1137,8 +1137,8 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
     String tableName = "t_" + UUID.randomUUID().toString().replace('-', '_');
     createEmptyTestTable(tablePath, tableName);
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(tablePath, spark.sessionState().newHadoopConf());
-    Snapshot snapshot = snapshotManager.loadLatestSnapshot();
+        new PathBasedSnapshotManager(tablePath);
+    Snapshot snapshot = snapshotManager.loadLatestSnapshot(engine);
     return MetadataEvolutionHandler.getPersistedMetadataForMicroBatchStream(
         spark, snapshot, options, snapshotManager, defaultEngine);
   }
@@ -1159,8 +1159,8 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
     String tableName = "t_" + UUID.randomUUID().toString().replace('-', '_');
     createEmptyTestTable(tablePath, tableName);
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(tablePath, spark.sessionState().newHadoopConf());
-    Snapshot dsv1Snapshot = snapshotManager.loadLatestSnapshot();
+        new PathBasedSnapshotManager(tablePath);
+    Snapshot dsv1Snapshot = snapshotManager.loadLatestSnapshot(engine);
     SnapshotImpl snapshot = DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(dsv1Snapshot);
 
     String schemaLogPath = new File(tempDir, "schema_log").getAbsolutePath();
@@ -1214,8 +1214,8 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
     String tableName = "t_" + UUID.randomUUID().toString().replace('-', '_');
     createEmptyTestTable(tablePath, tableName);
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(tablePath, spark.sessionState().newHadoopConf());
-    return DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadLatestSnapshot());
+        new PathBasedSnapshotManager(tablePath);
+    return DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadLatestSnapshot(engine));
   }
 
   /** Persisted metadata with schema, protocol, and configuration distinct from the source. */
@@ -1352,7 +1352,7 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
   private PersistedMetadata buildCurrentMetadataAtV0(
       String tablePath, PathBasedSnapshotManager snapshotManager) {
     SnapshotImpl v0 =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(0L));
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(engine, 0L));
     return PersistedMetadata.apply(
         "test-table-id",
         0L,
@@ -1427,7 +1427,7 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
     }
 
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(tablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(tablePath);
     PersistedMetadata current = buildCurrentMetadataAtV0(tablePath, snapshotManager);
 
     Option<PersistedMetadata> result =
@@ -1445,7 +1445,7 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
     assertTrue(result.isDefined());
     SnapshotImpl mergedSnapshot =
         DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
-            snapshotManager.loadSnapshotAt(expectedMergedVersion));
+            snapshotManager.loadSnapshotAt(engine, expectedMergedVersion));
     PersistedMetadata expected =
         PersistedMetadata.apply(
             "test-table-id",
@@ -1483,11 +1483,11 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
     spark.sql(String.format("UPDATE %s SET c3 = 10 WHERE id = 1", tableName)); // v4
 
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(tablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(tablePath);
 
     // current = v2 (the ALTER ADD COLUMN). Merger walks forward from here.
     SnapshotImpl v2Snapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(2L));
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(engine, 2L));
     PersistedMetadata current =
         PersistedMetadata.apply(
             "test-table-id",
@@ -1505,7 +1505,7 @@ public class MetadataEvolutionHandlerTest extends DeltaV2TestBase {
     assertEquals(3L, result.get().deltaCommitVersion());
 
     SnapshotImpl v3Snapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(3L));
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(engine, 3L));
     assertEquals(v3Snapshot.getMetadata().getSchemaString(), result.get().dataSchemaJson());
   }
 }

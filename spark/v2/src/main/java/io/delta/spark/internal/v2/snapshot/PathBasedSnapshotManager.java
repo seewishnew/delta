@@ -24,53 +24,48 @@ import io.delta.kernel.engine.Engine;
 import io.delta.kernel.internal.DeltaHistoryManager;
 import io.delta.kernel.internal.SnapshotImpl;
 import io.delta.spark.internal.v2.exception.VersionNotFoundException;
-import io.delta.spark.internal.v2.kernel.KernelEngineFactory;
 import java.util.ArrayList;
 import java.util.Optional;
-import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.annotation.Experimental;
 import org.apache.spark.sql.delta.Snapshot;
 import org.apache.spark.sql.delta.v2.interop.DeltaV2Snapshot;
 import org.apache.spark.sql.delta.v2.interop.DeltaV2SnapshotManager;
 
-/** Implementation of DeltaV2SnapshotManager for managing Delta snapshots for Path-based Table. */
+/**
+ * Implementation of DeltaV2SnapshotManager for managing Delta snapshots
+ * for Path-based Table.
+ */
 @Experimental
 public class PathBasedSnapshotManager implements DeltaV2SnapshotManager {
 
   private final String tablePath;
-  private final Engine kernelEngine;
 
-  public PathBasedSnapshotManager(String tablePath, Configuration hadoopConf) {
-    this(
-        tablePath,
-        KernelEngineFactory.createDefaultEngine(requireNonNull(hadoopConf, "hadoopConf is null")));
-  }
-
-  public PathBasedSnapshotManager(String tablePath, Engine kernelEngine) {
+  public PathBasedSnapshotManager(String tablePath) {
     this.tablePath = requireNonNull(tablePath, "tablePath is null");
-    this.kernelEngine = requireNonNull(kernelEngine, "kernelEngine is null");
   }
 
   /**
    * Loads the latest snapshot of the Delta table.
    *
+   * @param engine the engine for executing operations
    * @return the newly loaded snapshot
    */
   @Override
-  public Snapshot loadLatestSnapshot() {
-    SnapshotImpl kernelSnapshot = loadLatestKernelSnapshot();
+  public Snapshot loadLatestSnapshot(Engine engine) {
+    SnapshotImpl kernelSnapshot = loadLatestKernelSnapshot(engine);
     return wrapKernelSnapshot(kernelSnapshot);
   }
 
   /**
    * Loads a specific version of the Delta table.
    *
+   * @param engine the engine for executing operations
    * @param version the version to load
    * @return the snapshot at the specified version
    */
   @Override
-  public Snapshot loadSnapshotAt(long version) {
-    SnapshotImpl kernelSnapshot = loadKernelSnapshotAt(version);
+  public Snapshot loadSnapshotAt(Engine engine, long version) {
+    SnapshotImpl kernelSnapshot = loadKernelSnapshotAt(engine, version);
     return wrapKernelSnapshot(kernelSnapshot);
   }
 
@@ -78,39 +73,44 @@ public class PathBasedSnapshotManager implements DeltaV2SnapshotManager {
     return new DeltaV2Snapshot(kernelSnapshot);
   }
 
-  private SnapshotImpl loadLatestKernelSnapshot() {
-    return (SnapshotImpl) TableManager.loadSnapshot(tablePath).build(kernelEngine);
+  private SnapshotImpl loadLatestKernelSnapshot(Engine engine) {
+    return (SnapshotImpl)
+        TableManager.loadSnapshot(tablePath).build(engine);
   }
 
-  private SnapshotImpl loadKernelSnapshotAt(long version) {
+  private SnapshotImpl loadKernelSnapshotAt(Engine engine, long version) {
     return (SnapshotImpl)
-        TableManager.loadSnapshot(tablePath).atVersion(version).build(kernelEngine);
+        TableManager.loadSnapshot(tablePath)
+            .atVersion(version)
+            .build(engine);
   }
 
   /**
    * Finds the active commit at a specific timestamp.
    *
-   * <p>This method searches the Delta table's commit history to find the commit that was active at
-   * the specified timestamp.
+   * <p>This method searches the Delta table's commit history to find the
+   * commit that was active at the specified timestamp.
    *
+   * @param engine the engine for executing operations
    * @param timestampMillis the timestamp in milliseconds since epoch (UTC)
-   * @param canReturnLastCommit if true, returns the last commit if the timestamp is after all
-   *     commits
-   * @param mustBeRecreatable if true, only considers commits that can be recreated (i.e., all
-   *     necessary log files are available)
-   * @param canReturnEarliestCommit if true, returns the earliest commit if the timestamp is before
-   *     all commits
+   * @param canReturnLastCommit if true, returns the last commit if the
+   *     timestamp is after all commits
+   * @param mustBeRecreatable if true, only considers commits that can be
+   *     recreated (i.e., all necessary log files are available)
+   * @param canReturnEarliestCommit if true, returns the earliest commit
+   *     if the timestamp is before all commits
    * @return the commit that was active at the specified timestamp
    */
   @Override
   public DeltaHistoryManager.Commit getActiveCommitAtTime(
+      Engine engine,
       long timestampMillis,
       boolean canReturnLastCommit,
       boolean mustBeRecreatable,
       boolean canReturnEarliestCommit) {
-    SnapshotImpl snapshot = loadLatestKernelSnapshot();
+    SnapshotImpl snapshot = loadLatestKernelSnapshot(engine);
     return DeltaHistoryManager.getActiveCommitAtTimestamp(
-        kernelEngine,
+        engine,
         snapshot,
         snapshot.getLogPath(),
         timestampMillis,
@@ -121,45 +121,55 @@ public class PathBasedSnapshotManager implements DeltaV2SnapshotManager {
   }
 
   /**
-   * Checks if a specific version of the Delta table exists and is accessible.
+   * Checks if a specific version of the Delta table exists and is
+   * accessible.
    *
+   * @param engine the engine for executing operations
    * @param version the version to check
-   * @param mustBeRecreatable if true, requires that the version can be fully recreated from
-   *     available log files
-   * @param allowOutOfRange if true, allows versions greater than the latest version without
-   *     throwing an exception
+   * @param mustBeRecreatable if true, requires that the version can be
+   *     fully recreated from available log files
+   * @param allowOutOfRange if true, allows versions greater than the
+   *     latest version without throwing an exception
    * @throws VersionNotFoundException if the version is not available
    */
   @Override
-  public void checkVersionExists(long version, boolean mustBeRecreatable, boolean allowOutOfRange)
+  public void checkVersionExists(
+      Engine engine,
+      long version,
+      boolean mustBeRecreatable,
+      boolean allowOutOfRange)
       throws VersionNotFoundException {
-    SnapshotImpl snapshot = loadLatestKernelSnapshot();
+    SnapshotImpl snapshot = loadLatestKernelSnapshot(engine);
     long earliest =
         mustBeRecreatable
             ? DeltaHistoryManager.getEarliestRecreatableCommit(
-                kernelEngine,
+                engine,
                 snapshot.getLogPath(),
                 Optional.empty() /*earliestRatifiedCommitVersion*/)
             : DeltaHistoryManager.getEarliestDeltaFile(
-                kernelEngine,
+                engine,
                 snapshot.getLogPath(),
                 Optional.empty() /*earliestRatifiedCommitVersion*/);
 
     long latest = snapshot.getVersion();
-    if (version < earliest || ((version > latest) && !allowOutOfRange)) {
+    if (version < earliest
+        || ((version > latest) && !allowOutOfRange)) {
       throw new VersionNotFoundException(version, earliest, latest);
     }
   }
 
   @Override
-  public CommitRange getTableChanges(Engine engine, long startVersion, Optional<Long> endVersion) {
+  public CommitRange getTableChanges(
+      Engine engine, long startVersion, Optional<Long> endVersion) {
     CommitRangeBuilder builder =
         TableManager.loadCommitRange(
-            tablePath, CommitRangeBuilder.CommitBoundary.atVersion(startVersion));
+            tablePath,
+            CommitRangeBuilder.CommitBoundary.atVersion(startVersion));
 
     if (endVersion.isPresent()) {
-      builder =
-          builder.withEndBoundary(CommitRangeBuilder.CommitBoundary.atVersion(endVersion.get()));
+      builder = builder.withEndBoundary(
+          CommitRangeBuilder.CommitBoundary.atVersion(
+              endVersion.get()));
     }
 
     return builder.build(engine);

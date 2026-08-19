@@ -19,6 +19,7 @@ import io.delta.kernel.Snapshot;
 import io.delta.kernel.Transaction;
 import io.delta.kernel.data.Row;
 import io.delta.kernel.engine.Engine;
+import io.delta.spark.internal.v2.kernel.KernelEngineFactory;
 import io.delta.spark.internal.v2.read.DeltaParquetFileFormatV2;
 import io.delta.spark.internal.v2.utils.PartitionUtils;
 import io.delta.spark.internal.v2.utils.ScalaUtils;
@@ -78,15 +79,16 @@ class DeltaV2WriteContext {
   private final String sessionTimeZone;
 
   static DeltaV2WriteContext create(
-      Engine engine,
       Configuration hadoopConf,
       String tablePath,
       Snapshot initialSnapshot,
       StructType dataSchema,
       StructType partitionSchema,
       LogicalWriteInfo writeInfo) {
+    Engine engine = KernelEngineFactory.createDefaultEngine(hadoopConf);
     return new DeltaV2WriteContext(
-        engine, hadoopConf, tablePath, initialSnapshot, dataSchema, partitionSchema, writeInfo);
+        engine, hadoopConf, tablePath, initialSnapshot,
+        dataSchema, partitionSchema, writeInfo);
   }
 
   private static void verifySchemaForWrite(DeltaParquetFileFormatV2 format, StructType dataSchema) {

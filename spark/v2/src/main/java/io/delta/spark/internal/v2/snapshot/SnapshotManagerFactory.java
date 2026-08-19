@@ -16,7 +16,6 @@
 package io.delta.spark.internal.v2.snapshot;
 
 import io.delta.kernel.Meta;
-import io.delta.kernel.engine.Engine;
 import io.delta.kernel.unitycatalog.UCCatalogManagedClient;
 import io.delta.spark.internal.v2.snapshot.unitycatalog.UCManagedTableSnapshotManager;
 import io.delta.spark.internal.v2.snapshot.unitycatalog.UCTableInfo;
@@ -51,33 +50,37 @@ public final class SnapshotManagerFactory {
    * Creates a snapshot manager for the given table.
    *
    * @param tablePath the filesystem path to the Delta table
-   * @param kernelEngine the pre-configured Kernel {@link Engine} to use for table operations
    * @param catalogTable optional Spark catalog table metadata
    * @return a {@link DeltaV2SnapshotManager} appropriate for the table type
    */
   public static DeltaV2SnapshotManager create(
-      String tablePath, Engine kernelEngine, Optional<CatalogTable> catalogTable) {
+      String tablePath, Optional<CatalogTable> catalogTable) {
 
     if (catalogTable.isPresent()) {
       Optional<UCTableInfo> ucTableInfo =
-          UCUtils.extractTableInfo(catalogTable.get(), SparkSession.active());
+          UCUtils.extractTableInfo(
+              catalogTable.get(), SparkSession.active());
       if (ucTableInfo.isPresent()) {
-        return createUCManagedSnapshotManager(ucTableInfo.get(), kernelEngine);
+        return createUCManagedSnapshotManager(ucTableInfo.get());
       }
       // Catalog table without UC metadata falls back to path-based handling.
     }
 
     // Default: path-based snapshot manager for non-UC tables
-    return new PathBasedSnapshotManager(tablePath, kernelEngine);
+    return new PathBasedSnapshotManager(tablePath);
   }
 
   private static UCManagedTableSnapshotManager createUCManagedSnapshotManager(
-      UCTableInfo tableInfo, Engine kernelEngine) {
-    Map<String, String> ucConfig = new HashMap<>(tableInfo.toUcConfig());
+      UCTableInfo tableInfo) {
+    Map<String, String> ucConfig =
+        new HashMap<>(tableInfo.toUcConfig());
     ucConfig.put("appVersions.Kernel", Meta.KERNEL_VERSION);
     ucConfig.put("appVersions.Delta V2 connector", "true");
-    UCClient ucClient = UCTokenBasedRestClientFactory$.MODULE$.createUCClient(ucConfig);
-    UCCatalogManagedClient ucCatalogClient = new UCCatalogManagedClient(ucClient);
-    return new UCManagedTableSnapshotManager(ucCatalogClient, tableInfo, kernelEngine);
+    UCClient ucClient =
+        UCTokenBasedRestClientFactory$.MODULE$.createUCClient(ucConfig);
+    UCCatalogManagedClient ucCatalogClient =
+        new UCCatalogManagedClient(ucClient);
+    return new UCManagedTableSnapshotManager(
+        ucCatalogClient, tableInfo);
   }
 }

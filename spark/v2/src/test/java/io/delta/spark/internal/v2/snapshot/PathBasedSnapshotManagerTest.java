@@ -47,10 +47,10 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_volatile_snapshot";
     createEmptyTestTable(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
     DeltaLog deltaLog = DeltaLog.forTable(spark, new Path(testTablePath));
     org.apache.spark.sql.delta.Snapshot deltaSnapshot = deltaLog.unsafeVolatileSnapshot();
-    Snapshot kernelSnapshot = snapshotManager.loadLatestSnapshot();
+    Snapshot kernelSnapshot = snapshotManager.loadLatestSnapshot(engine);
 
     spark.sql(String.format("INSERT INTO %s VALUES (4, 'David')", testTableName));
 
@@ -64,19 +64,19 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_update";
     createEmptyTestTable(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
     DeltaLog deltaLog = DeltaLog.forTable(spark, new Path(testTablePath));
 
-    Snapshot initialSnapshot = snapshotManager.loadLatestSnapshot();
+    Snapshot initialSnapshot = snapshotManager.loadLatestSnapshot(engine);
     assertEquals(0L, initialSnapshot.getVersion());
 
     spark.sql(String.format("INSERT INTO %s VALUES (4, 'David')", testTableName));
 
     org.apache.spark.sql.delta.Snapshot deltaSnapshot =
         deltaLog.update(false, Option.empty(), Option.empty());
-    Snapshot updatedSnapshot = snapshotManager.loadLatestSnapshot();
+    Snapshot updatedSnapshot = snapshotManager.loadLatestSnapshot(engine);
     org.apache.spark.sql.delta.Snapshot cachedSnapshot = deltaLog.unsafeVolatileSnapshot();
-    Snapshot kernelcachedSnapshot = snapshotManager.loadLatestSnapshot();
+    Snapshot kernelcachedSnapshot = snapshotManager.loadLatestSnapshot(engine);
 
     assertEquals(1L, updatedSnapshot.getVersion());
     assertEquals(deltaSnapshot.version(), updatedSnapshot.getVersion());
@@ -91,11 +91,11 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_multiple_updates";
     createEmptyTestTable(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
 
     DeltaLog deltaLog = DeltaLog.forTable(spark, new Path(testTablePath));
 
-    assertEquals(0L, snapshotManager.loadLatestSnapshot().getVersion());
+    assertEquals(0L, snapshotManager.loadLatestSnapshot(engine).getVersion());
 
     for (int i = 0; i < 3; i++) {
       spark.sql(
@@ -103,7 +103,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
 
       org.apache.spark.sql.delta.Snapshot deltaSnapshot =
           deltaLog.update(false, Option.empty(), Option.empty());
-      Snapshot kernelSnapshot = snapshotManager.loadLatestSnapshot();
+      Snapshot kernelSnapshot = snapshotManager.loadLatestSnapshot(engine);
 
       long expectedVersion = i + 1;
       assertEquals(expectedVersion, deltaSnapshot.version());
@@ -117,7 +117,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_load_at_version";
     createEmptyTestTable(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
 
     // Create multiple versions
     for (int i = 0; i < 3; i++) {
@@ -126,16 +126,16 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     }
 
     // Load specific versions
-    Snapshot snapshot0 = snapshotManager.loadSnapshotAt(0L);
+    Snapshot snapshot0 = snapshotManager.loadSnapshotAt(engine, 0L);
     assertEquals(0L, snapshot0.getVersion());
 
-    Snapshot snapshot1 = snapshotManager.loadSnapshotAt(1L);
+    Snapshot snapshot1 = snapshotManager.loadSnapshotAt(engine, 1L);
     assertEquals(1L, snapshot1.getVersion());
 
-    Snapshot snapshot2 = snapshotManager.loadSnapshotAt(2L);
+    Snapshot snapshot2 = snapshotManager.loadSnapshotAt(engine, 2L);
     assertEquals(2L, snapshot2.getVersion());
 
-    Snapshot snapshot3 = snapshotManager.loadSnapshotAt(3L);
+    Snapshot snapshot3 = snapshotManager.loadSnapshotAt(engine, 3L);
     assertEquals(3L, snapshot3.getVersion());
 
     // Note: loadSnapshotAt does not update the cached snapshot
@@ -164,7 +164,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_commit_past";
     setupTableWithDeletedVersions(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
 
     Thread.sleep(100);
     Timestamp timestamp = new Timestamp(System.currentTimeMillis());
@@ -174,7 +174,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     org.apache.spark.sql.delta.DeltaHistoryManager.Commit deltaCommit =
         deltaLog
             .history()
-            .getActiveCommitAtTime(
+            .getActiveCommitAtTime(engine,
                 timestamp,
                 Option.empty() /* catalogTable */,
                 false /* canReturnLastCommit */,
@@ -182,7 +182,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
                 false /* canReturnEarliestCommit */);
 
     DeltaHistoryManager.Commit kernelCommit =
-        snapshotManager.getActiveCommitAtTime(
+        snapshotManager.getActiveCommitAtTime(engine,
             timestamp.getTime(),
             false /* canReturnLastCommit */,
             true /* mustBeRecreatable */,
@@ -199,7 +199,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_commit_future_last";
     setupTableWithDeletedVersions(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
 
     Timestamp futureTimestamp = new Timestamp(System.currentTimeMillis() + 10000);
 
@@ -207,7 +207,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     org.apache.spark.sql.delta.DeltaHistoryManager.Commit deltaCommit =
         deltaLog
             .history()
-            .getActiveCommitAtTime(
+            .getActiveCommitAtTime(engine,
                 futureTimestamp,
                 Option.empty() /* catalogTable */,
                 true /* canReturnLastCommit */,
@@ -215,7 +215,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
                 false /* canReturnEarliestCommit */);
 
     DeltaHistoryManager.Commit kernelCommit =
-        snapshotManager.getActiveCommitAtTime(
+        snapshotManager.getActiveCommitAtTime(engine,
             futureTimestamp.getTime(),
             true /* canReturnLastCommit */,
             true /* mustBeRecreatable */,
@@ -232,7 +232,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_commit_future_not_recreatable";
     setupTableWithDeletedVersions(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
 
     Timestamp futureTimestamp = new Timestamp(System.currentTimeMillis() + 10000);
 
@@ -240,7 +240,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     org.apache.spark.sql.delta.DeltaHistoryManager.Commit deltaCommit =
         deltaLog
             .history()
-            .getActiveCommitAtTime(
+            .getActiveCommitAtTime(engine,
                 futureTimestamp,
                 Option.empty() /* catalogTable */,
                 true /* canReturnLastCommit */,
@@ -248,7 +248,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
                 false /* canReturnEarliestCommit */);
 
     DeltaHistoryManager.Commit kernelCommit =
-        snapshotManager.getActiveCommitAtTime(
+        snapshotManager.getActiveCommitAtTime(engine,
             futureTimestamp.getTime(),
             true /* canReturnLastCommit */,
             false /* mustBeRecreatable */,
@@ -265,7 +265,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_commit_early";
     setupTableWithDeletedVersions(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
 
     Timestamp earlyTimestamp = new Timestamp(0);
 
@@ -273,7 +273,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     org.apache.spark.sql.delta.DeltaHistoryManager.Commit deltaCommit =
         deltaLog
             .history()
-            .getActiveCommitAtTime(
+            .getActiveCommitAtTime(engine,
                 earlyTimestamp,
                 Option.empty() /* catalogTable */,
                 false /* canReturnLastCommit */,
@@ -281,7 +281,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
                 true /* canReturnEarliestCommit */);
 
     DeltaHistoryManager.Commit kernelCommit =
-        snapshotManager.getActiveCommitAtTime(
+        snapshotManager.getActiveCommitAtTime(engine,
             earlyTimestamp.getTime(),
             false /* canReturnLastCommit */,
             true /* mustBeRecreatable */,
@@ -298,7 +298,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_commit_early_not_recreatable";
     setupTableWithDeletedVersions(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
 
     Timestamp earlyTimestamp = new Timestamp(0);
 
@@ -306,7 +306,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     org.apache.spark.sql.delta.DeltaHistoryManager.Commit deltaCommit =
         deltaLog
             .history()
-            .getActiveCommitAtTime(
+            .getActiveCommitAtTime(engine,
                 earlyTimestamp,
                 Option.empty() /* catalogTable */,
                 false /* canReturnLastCommit */,
@@ -314,7 +314,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
                 true /* canReturnEarliestCommit */);
 
     DeltaHistoryManager.Commit kernelCommit =
-        snapshotManager.getActiveCommitAtTime(
+        snapshotManager.getActiveCommitAtTime(engine,
             earlyTimestamp.getTime(),
             false /* canReturnLastCommit */,
             false /* mustBeRecreatable */,
@@ -378,7 +378,7 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
     String testTableName = "test_version_" + testName;
     setupTableWithDeletedVersions(testTablePath, testTableName);
     snapshotManager =
-        new PathBasedSnapshotManager(testTablePath, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(testTablePath);
     DeltaLog deltaLog = DeltaLog.forTable(spark, new Path(testTablePath));
 
     if (shouldThrow) {
@@ -396,10 +396,10 @@ public class PathBasedSnapshotManagerTest extends DeltaV2TestBase {
                   .checkVersionExists(
                       versionToCheck, Option.empty(), mustBeRecreatable, allowOutOfRange));
     } else {
-      snapshotManager.checkVersionExists(versionToCheck, mustBeRecreatable, allowOutOfRange);
+      snapshotManager.checkVersionExists(engine, versionToCheck, mustBeRecreatable, allowOutOfRange);
       deltaLog
           .history()
-          .checkVersionExists(versionToCheck, Option.empty(), mustBeRecreatable, allowOutOfRange);
+          .checkVersionExists(engine, versionToCheck, Option.empty(), mustBeRecreatable, allowOutOfRange);
     }
   }
 }

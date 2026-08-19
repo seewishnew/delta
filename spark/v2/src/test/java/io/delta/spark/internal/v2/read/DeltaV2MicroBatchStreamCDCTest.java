@@ -72,7 +72,7 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
     sql("INSERT INTO %s VALUES (1, 'User1')", tableName);
 
     Configuration hadoopConf = new Configuration();
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
     DeltaV2MicroBatchStream stream =
         createTestStreamWithDefaults(snapshotManager, hadoopConf, emptyDeltaOptions());
 
@@ -109,11 +109,11 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
     sql("INSERT INTO %s VALUES (1, 'User1')", tableName);
 
     Configuration hadoopConf = new Configuration();
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
     DeltaV2MicroBatchStream stream =
         createTestStreamWithDefaults(snapshotManager, hadoopConf, emptyDeltaOptions());
 
-    long initVersion = snapshotManager.loadLatestSnapshot().getVersion();
+    long initVersion = snapshotManager.loadLatestSnapshot(engine).getVersion();
     assertDoesNotThrow(() -> stream.validateCDFEnabledOnTable(initVersion));
   }
 
@@ -129,7 +129,7 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
     sql("INSERT INTO %s VALUES (2, 'User2')", tableName);
 
     Configuration hadoopConf = new Configuration();
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
     DeltaV2MicroBatchStream stream =
         createTestStreamWithDefaults(snapshotManager, hadoopConf, emptyDeltaOptions());
 
@@ -151,10 +151,10 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
     sql("INSERT INTO %s VALUES (1, 'User1')", tableName);
 
     Configuration hadoopConf = new Configuration();
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
     DeltaV2MicroBatchStream stream =
         createTestStreamWithDefaults(snapshotManager, hadoopConf, emptyDeltaOptions());
-    long latestVersion = snapshotManager.loadLatestSnapshot().getVersion();
+    long latestVersion = snapshotManager.loadLatestSnapshot(engine).getVersion();
 
     // startingVersion=latest resolves to latest+1, which is not materialized. The KernelException
     // is swallowed and the validator returns without throwing.
@@ -268,7 +268,7 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
 
     // DSv2
     Configuration hadoopConf = new Configuration();
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
     DeltaV2MicroBatchStream stream =
         createTestStreamWithDefaults(snapshotManager, hadoopConf, emptyDeltaOptions());
     List<IndexedFile> dsv2Files = new ArrayList<>();
@@ -1027,7 +1027,7 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
   private DeltaV2MicroBatchStream createStreamWithSeededTrackingLog(
       String tablePath, String schemaLogPath, long seededVersion) {
     Configuration hadoopConf = new Configuration();
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
     Engine engine = DefaultEngine.create(hadoopConf);
 
     Map<String, String> javaOptions = new HashMap<>();
@@ -1037,10 +1037,10 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
         ScalaUtils.toScalaMap(javaOptions);
     DeltaOptions deltaOptions = new DeltaOptions(scalaOptions, spark.sessionState().conf());
 
-    Snapshot latestSnapshot = snapshotManager.loadLatestSnapshot();
+    Snapshot latestSnapshot = snapshotManager.loadLatestSnapshot(engine);
     SnapshotImpl seededSnapshot =
         DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
-            snapshotManager.loadSnapshotAt(seededVersion));
+            snapshotManager.loadSnapshotAt(engine, seededVersion));
 
     org.apache.spark.sql.delta.sources.DeltaSourceMetadataTrackingLog trackingLog =
         MetadataEvolutionHandler.getMetadataTrackingLogForMicroBatchStream(
@@ -1125,7 +1125,7 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
       Optional<Long> maxBytes)
       throws Exception {
     Configuration hadoopConf = new Configuration();
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
     DeltaV2MicroBatchStream stream =
         createTestStreamWithDefaults(snapshotManager, hadoopConf, emptyDeltaOptions());
     List<IndexedFile> files = new ArrayList<>();
@@ -1184,7 +1184,7 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
 
   private DeltaV2MicroBatchStream createTestStreamWithDefaults(
       PathBasedSnapshotManager snapshotManager, Configuration hadoopConf, DeltaOptions options) {
-    Snapshot snapshot = snapshotManager.loadLatestSnapshot();
+    Snapshot snapshot = snapshotManager.loadLatestSnapshot(engine);
     StructType tableSchema = snapshot.schema();
     return new DeltaV2MicroBatchStream(
         snapshotManager,
@@ -1205,14 +1205,14 @@ class DeltaV2MicroBatchStreamCDCTest extends DeltaV2TestBase {
 
   private DeltaV2MicroBatchStream createStream(String tablePath) {
     Configuration hadoopConf = new Configuration();
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
     return createTestStreamWithDefaults(snapshotManager, hadoopConf, emptyDeltaOptions());
   }
 
   private CommitActions getCommitActions(String tablePath, long version) {
     Configuration hadoopConf = new Configuration();
     Engine engine = DefaultEngine.create(hadoopConf);
-    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath, hadoopConf);
+    PathBasedSnapshotManager snapshotManager = new PathBasedSnapshotManager(tablePath);
 
     CommitRange commitRange =
         snapshotManager.getTableChanges(engine, version, Optional.of(version));

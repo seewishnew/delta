@@ -19,7 +19,6 @@ import static java.util.Objects.requireNonNull;
 
 import com.google.common.annotations.VisibleForTesting;
 import io.delta.kernel.Snapshot;
-import io.delta.kernel.engine.Engine;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -76,7 +75,6 @@ class DeltaV2Write implements Write, RequiresDistributionAndOrdering {
           DeltaOptions.TXN_VERSION(),
           DeltaOptions.USER_METADATA_OPTION());
 
-  private final Engine engine;
   private final Configuration hadoopConf;
   private final String tablePath;
   private final Snapshot initialSnapshot;
@@ -87,15 +85,15 @@ class DeltaV2Write implements Write, RequiresDistributionAndOrdering {
   private final LogicalWriteInfo writeInfo;
 
   /**
-   * @param initialSnapshot the batch's planned snapshot the write state is built from (and the
-   *     streaming guard's schema/protocol baseline)
-   * @param snapshotManager reloads the latest snapshot per epoch on the streaming path; unused by
-   *     the batch path (a single commit off {@code initialSnapshot})
+   * @param hadoopConf Hadoop conf each write mode builds its engine from
+   * @param initialSnapshot the batch's planned snapshot the write state
+   *     is built from (and the streaming guard's schema/protocol baseline)
+   * @param snapshotManager reloads the latest snapshot per epoch on the
+   *     streaming path; unused by the batch path
    * @param dataSchema the non-partition columns (the Parquet file body)
-   * @param partitionSchema the partition columns in partition order (empty when unpartitioned)
+   * @param partitionSchema the partition columns in partition order
    */
   DeltaV2Write(
-      Engine engine,
       Configuration hadoopConf,
       String tablePath,
       Snapshot initialSnapshot,
@@ -103,15 +101,21 @@ class DeltaV2Write implements Write, RequiresDistributionAndOrdering {
       StructType dataSchema,
       StructType partitionSchema,
       LogicalWriteInfo writeInfo) {
-    this.engine = requireNonNull(engine, "engine is null");
-    this.hadoopConf = requireNonNull(hadoopConf, "hadoopConf is null");
-    this.tablePath = requireNonNull(tablePath, "tablePath is null");
-    this.initialSnapshot = requireNonNull(initialSnapshot, "initialSnapshot is null");
-    this.snapshotManager = requireNonNull(snapshotManager, "snapshotManager is null");
-    this.dataSchema = requireNonNull(dataSchema, "dataSchema is null");
-    this.partitionSchema = requireNonNull(partitionSchema, "partitionSchema is null");
+    this.hadoopConf =
+        requireNonNull(hadoopConf, "hadoopConf is null");
+    this.tablePath =
+        requireNonNull(tablePath, "tablePath is null");
+    this.initialSnapshot =
+        requireNonNull(initialSnapshot, "initialSnapshot is null");
+    this.snapshotManager =
+        requireNonNull(snapshotManager, "snapshotManager is null");
+    this.dataSchema =
+        requireNonNull(dataSchema, "dataSchema is null");
+    this.partitionSchema =
+        requireNonNull(partitionSchema, "partitionSchema is null");
     this.writeInfo = requireNonNull(writeInfo, "writeInfo is null");
-    this.queryId = requireNonNull(writeInfo.queryId(), "queryId is null");
+    this.queryId =
+        requireNonNull(writeInfo.queryId(), "queryId is null");
   }
 
   /**
@@ -124,23 +128,21 @@ class DeltaV2Write implements Write, RequiresDistributionAndOrdering {
 
   @Override
   public BatchWrite toBatch() {
-    // The batch path builds its own driver-side context (DeltaV2BatchWriteContext) and commits a
-    // single transaction off initialSnapshot.
     return new DeltaV2BatchWrite(
-        engine, hadoopConf, tablePath, initialSnapshot, dataSchema, partitionSchema, writeInfo);
+        hadoopConf, tablePath, initialSnapshot,
+        dataSchema, partitionSchema, writeInfo);
   }
 
   @Override
   public StreamingWrite toStreaming() {
     rejectUnsupportedStreamingOptions();
-    // Build the operation-independent write context once; the streaming write drives its own
-    // per-epoch transactions (Operation.STREAMING_UPDATE) and reuses buildDataWriterFactory to
-    // produce the executor write state -- the same setup the batch path uses, no duplication.
     DeltaV2WriteContext context =
         DeltaV2WriteContext.create(
-            engine, hadoopConf, tablePath, initialSnapshot, dataSchema, partitionSchema, writeInfo);
+            hadoopConf, tablePath, initialSnapshot,
+            dataSchema, partitionSchema, writeInfo);
     return new DeltaV2StreamingWrite(
-        engine, initialSnapshot, snapshotManager, queryId, context::buildDataWriterFactory);
+        hadoopConf, initialSnapshot, snapshotManager,
+        queryId, context::buildDataWriterFactory);
   }
 
   /**

@@ -349,7 +349,7 @@ public class MetadataEvolutionHandler {
       protocol = new KernelProtocolAdapter(validated.protocol);
     } else {
       org.apache.spark.sql.delta.Snapshot snapshot =
-          snapshotManager.loadSnapshotAt(batchStartVersion);
+          snapshotManager.loadSnapshotAt(engine, batchStartVersion);
       version = snapshot.getVersion();
       metadata = snapshot.metadata();
       protocol = snapshot.protocol();
@@ -434,7 +434,8 @@ public class MetadataEvolutionHandler {
     List<Metadata> metadataChanges =
         new ArrayList<>(collectMetadataActions(startVersion, endVersion).values());
     SnapshotImpl startSnapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadSnapshotAt(startVersion));
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
+            snapshotManager.loadSnapshotAt(engine, startVersion));
     Metadata startMetadata = startSnapshot.getMetadata();
 
     // Try to find rename or drop columns in between, or nullability/datatype changes by using

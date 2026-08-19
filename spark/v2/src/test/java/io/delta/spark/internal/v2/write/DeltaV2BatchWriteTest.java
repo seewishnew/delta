@@ -402,14 +402,14 @@ public class DeltaV2BatchWriteTest extends DeltaV2TestBase {
               DataTypes.createStructField("p2", DataTypes.IntegerType, true)
             });
     PathBasedSnapshotManager mgr =
-        new PathBasedSnapshotManager(path, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(path);
     DeltaV2BatchWrite write =
         (DeltaV2BatchWrite)
             new DeltaV2Write(
                     defaultEngine,
                     spark.sessionState().newHadoopConf(),
                     path,
-                    DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot()),
+                    DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot(engine)),
                     mgr,
                     data,
                     part,
@@ -496,13 +496,13 @@ public class DeltaV2BatchWriteTest extends DeltaV2TestBase {
               DataTypes.createStructField("p2", DataTypes.IntegerType, true)
             });
     PathBasedSnapshotManager mgr =
-        new PathBasedSnapshotManager(path, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(path);
     return (DeltaV2BatchWrite)
         new DeltaV2Write(
                 defaultEngine,
                 spark.sessionState().newHadoopConf(),
                 path,
-                DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot()),
+                DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot(engine)),
                 mgr,
                 data,
                 part,
@@ -538,13 +538,13 @@ public class DeltaV2BatchWriteTest extends DeltaV2TestBase {
         DataTypes.createStructType(
             new StructField[] {DataTypes.createStructField("part", DataTypes.TimestampType, true)});
     PathBasedSnapshotManager mgr =
-        new PathBasedSnapshotManager(path, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(path);
     return (DeltaV2BatchWrite)
         new DeltaV2Write(
                 defaultEngine,
                 spark.sessionState().newHadoopConf(),
                 path,
-                DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot()),
+                DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(mgr.loadLatestSnapshot(engine)),
                 mgr,
                 data,
                 part,
@@ -564,9 +564,9 @@ public class DeltaV2BatchWriteTest extends DeltaV2TestBase {
 
   private DeltaV2BatchWrite newPartitionedWrite(String path) {
     PathBasedSnapshotManager snapshotManager =
-        new PathBasedSnapshotManager(path, spark.sessionState().newHadoopConf());
+        new PathBasedSnapshotManager(path);
     Snapshot snapshot =
-        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadLatestSnapshot());
+        DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(snapshotManager.loadLatestSnapshot(engine));
     LogicalWriteInfo info =
         WriteTestUtils.logicalWriteInfo(PARTITIONED_FULL_SCHEMA, CaseInsensitiveStringMap.empty());
     DeltaV2Write write =
@@ -666,8 +666,8 @@ public class DeltaV2BatchWriteTest extends DeltaV2TestBase {
   private DeltaV2BatchWrite newWrite(String path) {
     Snapshot snapshot =
         DeltaV2Snapshot$.MODULE$.borrowKernelSnapshot(
-            new PathBasedSnapshotManager(path, spark.sessionState().newHadoopConf())
-                .loadLatestSnapshot());
+            new PathBasedSnapshotManager(path)
+                .loadLatestSnapshot(engine));
     LogicalWriteInfo info =
         WriteTestUtils.logicalWriteInfo(TABLE_SCHEMA, CaseInsensitiveStringMap.empty());
     return new DeltaV2BatchWrite(

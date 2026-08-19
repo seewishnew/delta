@@ -32,23 +32,35 @@ import org.apache.spark.annotation.Experimental
  * This connector exposes loaded state through the V1 snapshot facade so callers use the same
  * metadata, protocol, schema, timestamp, column-mapping, and file-access surface as V1. Kernel
  * execution details remain confined to the connector's execution seams.
+ *
+ * Implementations never retain the [[Engine]] passed to them: every engine-backed operation takes
+ * one as a parameter, uses it for that call only, and does not close it. The caller owns the
+ * engine's lifecycle, which keeps creation and release in one place and lets a single engine serve
+ * several calls. This mirrors Kernel's own convention, where a snapshot holds no engine and each
+ * operation on it accepts one.
  */
 @Experimental
 trait DeltaV2SnapshotManager {
 
-  /** Loads and returns the latest snapshot of the Delta table. */
-  def loadLatestSnapshot(): Snapshot
+  /**
+   * Loads and returns the latest snapshot of the Delta table.
+   *
+   * @param engine the engine for executing operations; not retained or closed
+   */
+  def loadLatestSnapshot(engine: Engine): Snapshot
 
   /**
    * Loads and returns a snapshot at a specific version.
    *
+   * @param engine the engine for executing operations
    * @param version the version number to load (must be >= 0)
    */
-  def loadSnapshotAt(version: Long): Snapshot
+  def loadSnapshotAt(engine: Engine, version: Long): Snapshot
 
   /**
    * Finds the commit that was active at a specific timestamp.
    *
+   * @param engine the engine for executing operations
    * @param timestampMillis timestamp in milliseconds since epoch (UTC)
    * @param canReturnLastCommit if true, returns the last commit when
    *   the timestamp is after all commits
@@ -58,6 +70,7 @@ trait DeltaV2SnapshotManager {
    *   when the timestamp is before all commits
    */
   def getActiveCommitAtTime(
+      engine: Engine,
       timestampMillis: Long,
       canReturnLastCommit: Boolean,
       mustBeRecreatable: Boolean,
@@ -66,6 +79,7 @@ trait DeltaV2SnapshotManager {
   /**
    * Checks if a specific version exists and is accessible.
    *
+   * @param engine the engine for executing operations
    * @param version the version to check
    * @param mustBeRecreatable if true, requires that the version can be
    *   fully recreated from available log files
@@ -75,6 +89,7 @@ trait DeltaV2SnapshotManager {
    */
   @throws[VersionNotFoundException]
   def checkVersionExists(
+      engine: Engine,
       version: Long,
       mustBeRecreatable: Boolean,
       allowOutOfRange: Boolean): Unit
@@ -82,7 +97,7 @@ trait DeltaV2SnapshotManager {
   /**
    * Gets a range of table changes between start and end versions.
    *
-   * @param engine the engine for executing operations
+   * @param engine the engine for executing operations; not retained or closed
    * @param startVersion starting version (inclusive)
    * @param endVersion optional ending version (inclusive)
    */
